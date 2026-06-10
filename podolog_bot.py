@@ -22,7 +22,7 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "8827220812:AAG7FxZR778sSDX9a_BBicW7Datw-7s7Mdg")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "Сюда токен")
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "223326752"))
 
 MASTER_NAME  = "Екатерина Шлейфер"
