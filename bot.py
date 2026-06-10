@@ -30,7 +30,7 @@ from telegram.ext import (
 
 # ── Настройки ──────────────────────────────────────────────────────────────────
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8827220812:AAG7FxZR778sSDX9a_BBicW7Datw-7s7Mdg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН")
 ADMIN_ID  = int(os.getenv("ADMIN_ID", "223326752"))
 
 if not BOT_TOKEN or not ADMIN_ID:
@@ -185,7 +185,9 @@ def db_cancel_appointment(apt_id: str) -> dict | None:
 
 
 def db_reschedule(apt_id: str, new_date: str, new_time: str) -> bool:
-    new_id = f"{new_date}-{new_time.replace(':','-')}-" + apt_id.split("-")[-1]
+    # user_id — последний числовой сегмент после последнего "-"
+    user_part = apt_id.rsplit("-", 1)[-1]
+    new_id = f"{new_date}-{new_time.replace(':','-')}-{user_part}"
     with _db_lock, get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM appointments WHERE id=?", (apt_id,)
@@ -701,7 +703,7 @@ async def reschedule_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if db_reschedule(apt_id, new_date, new_time):
         # apt_id изменился — строим новый
-        new_apt_id = f"{new_date}-{new_time.replace(':','-')}-{apt_id.split('-')[-1]}"
+        new_apt_id = f"{new_date}-{new_time.replace(':','-')}-{uid}"
         schedule_reminders(ctx.application, new_apt_id, uid, new_date, new_time)
         apt = db_get_appointment(new_apt_id)
         try:
@@ -1021,7 +1023,8 @@ async def adm_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def adm_do_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    _, _, date, time = q.data.split("_", 3)
+    rest = q.data[len("adm_unblock_"):]   # "2026-06-10_10:00"
+    date, time = rest.rsplit("_", 1)
     db_unblock_slot(date, time)
     await q.edit_message_text(
         f"✅ Слот {fmt_date(date)} в {time} разблокирован.",
