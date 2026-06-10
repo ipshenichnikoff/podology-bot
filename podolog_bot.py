@@ -25,13 +25,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     ContextTypes, ConversationHandler, MessageHandler, filters,
+    PicklePersistence,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # НАСТРОЙКИ — вписывай сюда свои данные
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "8827220812:AAG7FxZR778sSDX9a_BBicW7Datw-7s7Mdg")
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "223326752"))
 
 MASTER_NAME  = "Екатерина Шлейфер"
@@ -678,7 +679,10 @@ async def cb_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if prev:
         ctx.user_data["name"]  = prev[0]
         ctx.user_data["phone"] = prev[1]
-        return await _show_confirm(q, ctx)
+        d = ctx.user_data
+        text = _confirm_text(d)
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_confirm())
+        return S_CONFIRM
 
     await q.edit_message_text("📝 Введите ваше *имя и фамилию:*", parse_mode="Markdown")
     return S_NAME
@@ -703,12 +707,16 @@ async def msg_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return S_PHONE
     ctx.user_data["phone"] = phone
-    return await _show_confirm(update, ctx)
-
-
-async def _show_confirm(src, ctx: ContextTypes.DEFAULT_TYPE):
     d = ctx.user_data
-    text = (
+    # Отправляем новое сообщение — у нас нет callback_query для edit
+    await update.message.reply_text(
+        _confirm_text(d), parse_mode="Markdown", reply_markup=kb_confirm()
+    )
+    return S_CONFIRM
+
+
+def _confirm_text(d: dict) -> str:
+    return (
         "📋 *Подтвердите запись:*\n\n"
         f"💆 {d['proc']}\n"
         f"📅 {fmt_date(d['date'])} в {d['time']}\n"
@@ -716,11 +724,6 @@ async def _show_confirm(src, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 {d['name']}\n"
         f"📱 {d['phone']}"
     )
-    if hasattr(src, "edit_message_text"):
-        await src.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_confirm())
-    else:
-        await src.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_confirm())
-    return S_CONFIRM
 
 
 async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -728,6 +731,15 @@ async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     d   = ctx.user_data
     uid = update.effective_user.id
+
+    # Данные пропали — бот перезапустился пока клиент не подтвердил
+    if not d.get("proc") or not d.get("date") or not d.get("time"):
+        await q.edit_message_text(
+            "⚠️ Сессия устарела — пожалуйста, начните запись заново.",
+            reply_markup=kb_main(uid),
+        )
+        return S_MAIN
+
     try:
         apt_id = add_apt(
             d["date"], d["time"], d["name"], d["phone"], uid,
@@ -1146,7 +1158,8 @@ async def adm_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath="podolog_persistence")
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
@@ -1243,6 +1256,20 @@ def main():
     )
 
     app.add_handler(conv)
+
+    # Глобальные обработчики — работают даже если ConversationHandler
+    # потерял состояние пользователя. Перехватывают основные кнопки меню.
+    for pattern, handler in [
+        ("^book$",       cb_book),
+        ("^my_apts$",    cb_my_apts),
+        ("^prices$",     cb_prices),
+        ("^about$",      cb_about),
+        ("^contact$",    cb_contact),
+        ("^admin$",      cb_admin),
+        ("^back_main$",  cb_back_main),
+        ("^cancel_",     cb_cancel_apt),
+    ]:
+        app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
 
     if app.job_queue:
         log.info("Напоминания активны ✅")
