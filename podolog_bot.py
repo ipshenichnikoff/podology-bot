@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-PODOLOG BOT — финальная версия.
-Состояния хранятся в user_data. Один роутер обрабатывает все кнопки.
+PODOLOG BOT — улучшенная версия.
 Установка: pip install "python-telegram-bot[job-queue]"
 """
 
@@ -12,7 +11,11 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, PicklePersistence, filters,
@@ -22,21 +25,21 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "Сюда токен")
-ADMIN_ID     = int(os.getenv("ADMIN_ID", "223326752"))
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "Сюда токен")
+ADMIN_ID      = int(os.getenv("ADMIN_ID", "223326752"))
 
-MASTER_NAME  = "Екатерина Шлейфер"
-MASTER_PHONE = "8 (920) 649 26-16"
-MASTER_TG    = "@master"
-MASTER_SINCE = "2018"
-MASTER_RATING= "4.9"
-MASTER_ABOUT = (
+MASTER_NAME   = "Екатерина Шлейфер"
+MASTER_PHONE  = "8 (920) 649 26-16"
+MASTER_TG     = "@master"
+MASTER_SINCE  = "2018"
+MASTER_RATING = "4.9"
+MASTER_ABOUT  = (
     "Профессиональный подолог с 2018 года.\n"
     "Более 200 довольных клиентов.\n"
     "Работаю аккуратно, без боли и стресса. 🌸"
 )
 
-WORK_DAYS  = [0, 1, 2, 3, 4, 5]   # пн–сб
+WORK_DAYS  = [0, 1, 2, 3, 4, 5]  # пн–сб
 WORK_START = 10
 WORK_END   = 20
 SLOT_MIN   = 60
@@ -59,15 +62,14 @@ PROCEDURES = [
      "Комплексная зачистка + подбор терапевтического ухода."),
 ]
 
-# Состояния (хранятся в user_data["state"])
-ST_MAIN      = "main"
-ST_PROC      = "proc"
-ST_DATE      = "date"
-ST_TIME      = "time"
-ST_NAME      = "name"
-ST_PHONE     = "phone"
-ST_CONFIRM   = "confirm"
-ST_ADM       = "adm"
+# Состояния
+ST_MAIN          = "main"
+ST_PROC          = "proc"
+ST_DATE          = "date"
+ST_TIME          = "time"
+ST_PHONE         = "phone"
+ST_CONFIRM       = "confirm"
+ST_ADM           = "adm"
 ST_ADM_ADD_NAME  = "adm_add_name"
 ST_ADM_ADD_PHONE = "adm_add_phone"
 
@@ -87,16 +89,16 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# БД
+# БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def db():
+def _db():
     c = sqlite3.connect(DB_FILE, check_same_thread=False)
     c.row_factory = sqlite3.Row
     return c
 
 def init_db():
-    with _lock, db() as c:
+    with _lock, _db() as c:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS appointments (
                 id TEXT PRIMARY KEY, date TEXT, time TEXT,
@@ -110,7 +112,42 @@ def init_db():
             CREATE TABLE IF NOT EXISTS dayoff (
                 date TEXT PRIMARY KEY, reason TEXT DEFAULT 'Выходной'
             );
+            CREATE TABLE IF NOT EXISTS clients (
+                user_id    INTEGER PRIMARY KEY,
+                name       TEXT,
+                phone      TEXT,
+                last_proc  TEXT,
+                visits     INTEGER DEFAULT 0
+            );
         """)
+        # Миграция: добавляем таблицу clients если её нет (для старых БД)
+        try:
+            c.execute("ALTER TABLE appointments ADD COLUMN duration INTEGER DEFAULT 60")
+        except Exception:
+            pass
+
+# ── Клиенты ──────────────────────────────────────────────────────────────────
+
+def save_client(uid, name, phone):
+    with _lock, _db() as c:
+        c.execute("""
+            INSERT INTO clients(user_id,name,phone,visits) VALUES(?,?,?,1)
+            ON CONFLICT(user_id) DO UPDATE SET name=?,phone=?,visits=visits+1
+        """, (uid, name, phone, name, phone))
+
+def get_client(uid):
+    with _lock, _db() as c:
+        row = c.execute("SELECT * FROM clients WHERE user_id=?", (uid,)).fetchone()
+    return dict(row) if row else None
+
+def set_last_proc(uid, proc):
+    with _lock, _db() as c:
+        c.execute("""
+            INSERT INTO clients(user_id,last_proc) VALUES(?,?)
+            ON CONFLICT(user_id) DO UPDATE SET last_proc=?
+        """, (uid, proc, proc))
+
+# ── Слоты ────────────────────────────────────────────────────────────────────
 
 def today():
     return datetime.now().strftime("%Y-%m-%d")
@@ -120,25 +157,25 @@ def fmt_date(d):
     return f"{WEEKDAYS[dt.weekday()]}, {dt.day} {MONTHS[dt.month]}"
 
 def is_dayoff(date):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         return c.execute("SELECT 1 FROM dayoff WHERE date=?", (date,)).fetchone() is not None
 
 def toggle_dayoff(date):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         if c.execute("SELECT 1 FROM dayoff WHERE date=?", (date,)).fetchone():
             c.execute("DELETE FROM dayoff WHERE date=?", (date,))
             return "removed"
         c.execute("INSERT INTO dayoff(date) VALUES(?)", (date,))
         return "added"
 
-def booked(date):
-    with _lock, db() as c:
+def _booked(date):
+    with _lock, _db() as c:
         return {r["time"] for r in c.execute(
             "SELECT time FROM appointments WHERE date=? AND status!='cancelled'", (date,)
         )}
 
-def blocked(date):
-    with _lock, db() as c:
+def _blocked(date):
+    with _lock, _db() as c:
         return {r["time"] for r in c.execute(
             "SELECT time FROM blocked WHERE date=?", (date,)
         )}
@@ -146,7 +183,7 @@ def blocked(date):
 def free_slots(date):
     if is_dayoff(date):
         return []
-    taken = booked(date) | blocked(date)
+    taken = _booked(date) | _blocked(date)
     slots, t = [], WORK_START * 60
     while t + SLOT_MIN <= WORK_END * 60:
         hh, mm = divmod(t, 60)
@@ -157,7 +194,7 @@ def free_slots(date):
     return slots
 
 def all_slots_status(date):
-    b, bl = booked(date), blocked(date)
+    b, bl = _booked(date), _blocked(date)
     result, t = [], WORK_START * 60
     while t + SLOT_MIN <= WORK_END * 60:
         hh, mm = divmod(t, 60)
@@ -182,9 +219,11 @@ def available_dates():
         d += timedelta(days=1)
     return dates
 
+# ── Записи ───────────────────────────────────────────────────────────────────
+
 def add_apt(date, time, name, phone, uid, proc, dur, price):
     apt_id = f"{date}_{time.replace(':','')}_{uid}"
-    with _lock, db() as c:
+    with _lock, _db() as c:
         if c.execute(
             "SELECT 1 FROM appointments WHERE date=? AND time=? AND status='confirmed'",
             (date, time)
@@ -197,10 +236,12 @@ def add_apt(date, time, name, phone, uid, proc, dur, price):
             (apt_id, date, time, name, phone, uid, proc, dur, price,
              datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
+    save_client(uid, name, phone)
+    set_last_proc(uid, proc)
     return apt_id
 
 def cancel_apt(apt_id):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         row = c.execute(
             "SELECT * FROM appointments WHERE id=? AND status='confirmed'", (apt_id,)
         ).fetchone()
@@ -210,12 +251,12 @@ def cancel_apt(apt_id):
     return None
 
 def get_apt(apt_id):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         row = c.execute("SELECT * FROM appointments WHERE id=?", (apt_id,)).fetchone()
     return dict(row) if row else None
 
 def user_apts(uid):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         rows = c.execute(
             "SELECT * FROM appointments WHERE user_id=? AND status='confirmed' "
             "AND date>=? ORDER BY date,time", (uid, today())
@@ -223,42 +264,62 @@ def user_apts(uid):
     return [dict(r) for r in rows]
 
 def count_active(uid):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         return c.execute(
             "SELECT COUNT(*) FROM appointments WHERE user_id=? "
             "AND status='confirmed' AND date>=?", (uid, today())
         ).fetchone()[0]
 
 def day_apts(date):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         rows = c.execute(
             "SELECT * FROM appointments WHERE date=? AND status='confirmed' ORDER BY time",
             (date,)
         ).fetchall()
     return [dict(r) for r in rows]
 
-def prev_contact(uid):
-    with _lock, db() as c:
-        row = c.execute(
-            "SELECT name, phone FROM appointments WHERE user_id=? "
-            "ORDER BY created DESC LIMIT 1", (uid,)
-        ).fetchone()
-    return (row["name"], row["phone"]) if row else None
-
 def all_blocked_slots():
-    with _lock, db() as c:
+    with _lock, _db() as c:
         rows = c.execute(
-            "SELECT date, time FROM blocked WHERE date>=? ORDER BY date,time", (today(),)
+            "SELECT date,time FROM blocked WHERE date>=? ORDER BY date,time", (today(),)
         ).fetchall()
     return [dict(r) for r in rows]
 
 def block_slot(date, time):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         c.execute("INSERT OR IGNORE INTO blocked(date,time) VALUES(?,?)", (date, time))
 
 def unblock_slot(date, time):
-    with _lock, db() as c:
+    with _lock, _db() as c:
         c.execute("DELETE FROM blocked WHERE date=? AND time=?", (date, time))
+
+def get_stats():
+    now = datetime.now()
+    month_start = now.replace(day=1).strftime("%Y-%m-%d")
+    week_start  = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+    today_str   = today()
+    with _lock, _db() as c:
+        def rev(start):
+            row = c.execute(
+                "SELECT COUNT(*), COALESCE(SUM(price),0) FROM appointments "
+                "WHERE status='confirmed' AND date>=? AND date<=?",
+                (start, today_str)
+            ).fetchone()
+            return row[0], row[1]
+        tc, tr = rev(today_str)
+        wc, wr = rev(week_start)
+        mc, mr = rev(month_start)
+        top = c.execute(
+            "SELECT procedure, COUNT(*) cnt FROM appointments "
+            "WHERE status='confirmed' GROUP BY procedure ORDER BY cnt DESC LIMIT 3"
+        ).fetchall()
+        total_clients = c.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+    return dict(
+        today_count=tc, today_rev=tr,
+        week_count=wc,  week_rev=wr,
+        month_count=mc, month_rev=mr,
+        top=top, total_clients=total_clients
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # НАПОМИНАНИЯ
@@ -295,8 +356,8 @@ async def _remind(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.send_message(
             d["uid"],
-            f"🔔 *Напоминание!*\n\n"
-            f"Запись *{d['label']}*:\n"
+            f"🔔 *Напоминание о визите!*\n\n"
+            f"Вы записаны *{d['label']}*:\n"
             f"📅 {fmt_date(apt['date'])} в {apt['time']}\n"
             f"💆 {apt['procedure']}\n\n"
             f"Вопросы: {MASTER_PHONE}",
@@ -306,15 +367,44 @@ async def _remind(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("Ошибка отправки напоминания: %s", e)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def validate_phone(p):
+    return 7 <= len(re.sub(r"\D", "", p)) <= 15
+
+def set_state(ctx, state):
+    ctx.user_data["state"] = state
+
+def get_state(ctx):
+    return ctx.user_data.get("state", ST_MAIN)
+
+def confirm_text(d):
+    return (
+        "📋 *Подтвердите запись:*\n\n"
+        f"💆 {d['proc']}\n"
+        f"📅 {fmt_date(d['date'])} в {d['time']}\n"
+        f"⏱ {d['dur']} мин  •  💰 {d['price']:,} ₽\n\n".replace(",", " ") +
+        f"👤 {d['name']}\n"
+        f"📱 {d['phone']}"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def kb_main(uid):
-    rows = [
-        [InlineKeyboardButton("📅 Записаться",    callback_data="book")],
-        [InlineKeyboardButton("📋 Мои записи",    callback_data="my_apts")],
-        [InlineKeyboardButton("💆 Услуги и цены", callback_data="prices")],
-        [InlineKeyboardButton("👩‍⚕️ О мастере",  callback_data="about")],
+    client = get_client(uid)
+    rows = []
+    # Кнопка повтора если есть предыдущая процедура
+    if client and client.get("last_proc"):
+        short = client["last_proc"][:28] + "…" if len(client["last_proc"]) > 28 else client["last_proc"]
+        rows.append([InlineKeyboardButton(f"🔄 Повторить: {short}", callback_data="repeat")])
+    rows += [
+        [InlineKeyboardButton("📅 Записаться",    callback_data="book"),
+         InlineKeyboardButton("📋 Мои записи",    callback_data="my_apts")],
+        [InlineKeyboardButton("💆 Услуги и цены", callback_data="prices"),
+         InlineKeyboardButton("👩‍⚕️ О мастере",  callback_data="about")],
         [InlineKeyboardButton("📞 Контакты",       callback_data="contact")],
     ]
     if uid == ADMIN_ID:
@@ -370,15 +460,24 @@ def kb_my_apts(apts):
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
+def kb_phone():
+    """Reply-клавиатура с кнопкой поделиться номером."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
 def kb_admin():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Расписание на день",   callback_data="adm_sched")],
-        [InlineKeyboardButton("📆 Расписание на неделю", callback_data="adm_week")],
+        [InlineKeyboardButton("📅 Расписание на день",   callback_data="adm_sched"),
+         InlineKeyboardButton("📆 На неделю",            callback_data="adm_week")],
+        [InlineKeyboardButton("📊 Статистика",           callback_data="adm_stats")],
         [InlineKeyboardButton("➕ Добавить запись",      callback_data="adm_add")],
-        [InlineKeyboardButton("🚫 Заблокировать слот",   callback_data="adm_block")],
-        [InlineKeyboardButton("🔓 Разблокировать слот",  callback_data="adm_unblock")],
-        [InlineKeyboardButton("📵 Выходной день",        callback_data="adm_dayoff")],
-        [InlineKeyboardButton("❌ Отменить запись",       callback_data="adm_cancel")],
+        [InlineKeyboardButton("🚫 Заблокировать слот",   callback_data="adm_block"),
+         InlineKeyboardButton("🔓 Разблокировать",       callback_data="adm_unblock")],
+        [InlineKeyboardButton("📵 Выходной день",        callback_data="adm_dayoff"),
+         InlineKeyboardButton("❌ Отменить запись",       callback_data="adm_cancel")],
         [InlineKeyboardButton("◀️ Главное меню",         callback_data="main")],
     ])
 
@@ -399,74 +498,101 @@ def kb_adm_dates(days=14, prefix="adm_d"):
     return InlineKeyboardMarkup(rows)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ОБЩИЕ ФУНКЦИИ ПОКАЗА
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def validate_phone(p):
-    return 7 <= len(re.sub(r"\D", "", p)) <= 15
-
-def set_state(ctx, state):
-    ctx.user_data["state"] = state
-
-def get_state(ctx):
-    return ctx.user_data.get("state", ST_MAIN)
-
-async def show_main(update, ctx, text="Главное меню:"):
+async def show_main(update, ctx):
     uid = update.effective_user.id
     set_state(ctx, ST_MAIN)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb_main(uid))
+    client = get_client(uid)
+    if client and client.get("visits", 0) > 1:
+        greeting = f"С возвращением! 👋 Вы у нас {client['visits']} раз — спасибо за доверие! 🌸"
     else:
-        await update.message.reply_text(text, reply_markup=kb_main(uid))
+        greeting = "Главное меню — выберите действие:"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(greeting, reply_markup=kb_main(uid))
+    else:
+        await update.message.reply_text(greeting, reply_markup=kb_main(uid))
 
-def confirm_text(d):
-    return (
-        "📋 *Подтвердите запись:*\n\n"
-        f"💆 {d['proc']}\n"
-        f"📅 {fmt_date(d['date'])} в {d['time']}\n"
-        f"⏱ {d['dur']} мин  •  💰 {d['price']:,} ₽\n\n".replace(",", " ") +
-        f"👤 {d['name']}\n"
-        f"📱 {d['phone']}"
-    )
+async def start_booking(update, ctx, proc_idx=None):
+    """Запускает флоу записи. proc_idx — если уже известна процедура (повтор)."""
+    uid = update.effective_user.id
+    if count_active(uid) >= MAX_ACTIVE:
+        text = f"⚠️ У вас уже {MAX_ACTIVE} активных записи.\nОтмените одну, чтобы записаться снова."
+        kb   = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Мои записи", callback_data="my_apts"),
+            InlineKeyboardButton("◀️ Назад",   callback_data="main"),
+        ]])
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=kb)
+        else:
+            await update.message.reply_text(text, reply_markup=kb)
+        return
+
+    if proc_idx is not None:
+        name, dur, price, desc = PROCEDURES[proc_idx]
+        ctx.user_data.update(proc=name, dur=dur, price=price)
+        dates = available_dates()
+        if not dates:
+            text = "😔 Свободных дат пока нет. Загляните позже."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(text, reply_markup=kb_back("main"))
+            else:
+                await update.message.reply_text(text, reply_markup=kb_back("main"))
+            return
+        set_state(ctx, ST_DATE)
+        text = f"✅ *{name}*\n_{desc}_\n\n📅 Выберите дату:"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown",
+                                                           reply_markup=kb_dates(dates))
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown",
+                                            reply_markup=kb_dates(dates))
+    else:
+        set_state(ctx, ST_PROC)
+        text = "💆 *Выберите процедуру:*"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown",
+                                                           reply_markup=kb_procs())
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_procs())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ОБРАБОТЧИКИ КОМАНД
+# КОМАНДЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
+    uid  = update.effective_user.id
+    name = update.effective_user.first_name or "гость"
     set_state(ctx, ST_MAIN)
-    await update.message.reply_text(
-        f"👋 Привет, *{update.effective_user.first_name}*!\n\n"
-        f"Я помогу записаться к подологу *{MASTER_NAME}*.\n"
-        "Выберите действие:",
-        parse_mode="Markdown",
-        reply_markup=kb_main(update.effective_user.id),
-    )
+    client = get_client(uid)
+    if client:
+        text = (f"С возвращением, *{name}*! 👋\n\n"
+                f"Вы у нас уже {client['visits']} раз — спасибо за доверие! 🌸\n"
+                "Чем могу помочь?")
+    else:
+        text = (f"Привет, *{name}*! 👋\n\n"
+                f"Я помогу записаться к подологу *{MASTER_NAME}*.\n\n"
+                f"⭐ Рейтинг {MASTER_RATING} · Работает с {MASTER_SINCE} года\n\n"
+                "Выберите действие:")
+    await update.message.reply_text(text, parse_mode="Markdown",
+                                    reply_markup=kb_main(uid))
 
 async def cmd_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if count_active(uid) >= MAX_ACTIVE:
-        await update.message.reply_text(
-            f"⚠️ У вас уже {MAX_ACTIVE} активных записи. Отмените одну.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Мои записи", callback_data="my_apts"),
-            ]]))
-        return
-    set_state(ctx, ST_PROC)
-    await update.message.reply_text(
-        "💆 *Выберите процедуру:*", parse_mode="Markdown", reply_markup=kb_procs())
+    await start_booking(update, ctx)
 
 async def cmd_my_apts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     apts = user_apts(uid)
     if not apts:
-        await update.message.reply_text("У вас нет предстоящих записей.",
+        await update.message.reply_text(
+            "У вас нет предстоящих записей.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📅 Записаться", callback_data="book"),
             ]]))
         return
-    lines = ["📋 *Ваши записи:*\n"]
+    lines = ["📋 *Ваши предстоящие записи:*\n"]
     for a in apts:
         lines.append(f"• {fmt_date(a['date'])} в {a['time']} — {a['procedure']}")
     await update.message.reply_text(
@@ -502,25 +628,23 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Нет доступа.")
         return
     set_state(ctx, ST_ADM)
-    await update.message.reply_text(
-        "🔐 *Панель мастера:*", parse_mode="Markdown", reply_markup=kb_admin())
+    await update.message.reply_text("🔐 *Панель мастера:*",
+                                     parse_mode="Markdown", reply_markup=kb_admin())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ГЛАВНЫЙ РОУТЕР КНОПОК
+# РОУТЕР КНОПОК
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q   = update.callback_query
+    q    = update.callback_query
     await q.answer()
     data = q.data
     uid  = update.effective_user.id
-    log.info("КНОПКА: data='%s' uid=%s state='%s'", data, uid, get_state(ctx))
 
     # ── Главное меню ──────────────────────────────────────────────────────────
     if data == "main":
         ctx.user_data.clear()
-        set_state(ctx, ST_MAIN)
-        await q.edit_message_text("Главное меню:", reply_markup=kb_main(uid))
+        await show_main(update, ctx)
         return
 
     if data == "prices":
@@ -561,7 +685,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("◀️ Назад",      callback_data="main")],
                 ]))
             return
-        lines = ["📋 *Ваши записи:*\n"]
+        lines = ["📋 *Ваши предстоящие записи:*\n"]
         for a in apts:
             lines.append(f"• {fmt_date(a['date'])} в {a['time']} — {a['procedure']}")
         await q.edit_message_text(
@@ -591,31 +715,37 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("main"))
         return
 
-    # ── Запись: выбор процедуры ───────────────────────────────────────────────
+    # ── Запись ────────────────────────────────────────────────────────────────
     if data == "book":
-        if count_active(uid) >= MAX_ACTIVE:
-            await q.edit_message_text(
-                f"⚠️ У вас уже {MAX_ACTIVE} активных записи.\n"
-                "Отмените одну, чтобы записаться снова.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Мои записи", callback_data="my_apts")],
-                    [InlineKeyboardButton("◀️ Назад",   callback_data="main")],
-                ]))
-            return
-        set_state(ctx, ST_PROC)
-        await q.edit_message_text("💆 *Выберите процедуру:*",
-                                   parse_mode="Markdown", reply_markup=kb_procs())
+        await start_booking(update, ctx)
+        return
+
+    if data == "repeat":
+        client = get_client(uid)
+        if client and client.get("last_proc"):
+            for i, (name, *_) in enumerate(PROCEDURES):
+                if name == client["last_proc"]:
+                    await start_booking(update, ctx, proc_idx=i)
+                    return
+        await start_booking(update, ctx)
         return
 
     if data.startswith("proc_"):
+        # Проверяем что не в режиме добавления записи администратором
+        if ctx.user_data.get("adm_action") == "add_proc":
+            idx = int(data[5:])
+            name, dur, price, _ = PROCEDURES[idx]
+            ctx.user_data.update(adm_proc=name, adm_dur=dur, adm_price=price)
+            set_state(ctx, ST_ADM_ADD_NAME)
+            await q.edit_message_text("👤 Введите имя клиента:")
+            return
         idx = int(data[5:])
         name, dur, price, desc = PROCEDURES[idx]
         ctx.user_data.update(proc=name, dur=dur, price=price)
         dates = available_dates()
         if not dates:
-            await q.edit_message_text(
-                "😔 Свободных дат нет. Загляните позже.",
-                reply_markup=kb_back("main"))
+            await q.edit_message_text("😔 Свободных дат нет. Загляните позже.",
+                                       reply_markup=kb_back("main"))
             return
         set_state(ctx, ST_DATE)
         await q.edit_message_text(
@@ -637,9 +767,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["date"] = date
         slots = free_slots(date)
         if not slots:
-            await q.edit_message_text(
-                "На этот день нет свободных слотов.",
-                reply_markup=kb_dates(available_dates()))
+            await q.edit_message_text("На этот день нет свободных слотов.",
+                                       reply_markup=kb_dates(available_dates()))
             return
         set_state(ctx, ST_TIME)
         await q.edit_message_text(
@@ -650,28 +779,37 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("time_"):
         time = data[5:]
         ctx.user_data["time"] = time
-        prev = prev_contact(uid)
-        if prev:
-            ctx.user_data["name"]  = prev[0]
-            ctx.user_data["phone"] = prev[1]
+        client = get_client(uid)
+
+        # Имя берём из Telegram
+        tg_name = update.effective_user.full_name or update.effective_user.first_name or ""
+        ctx.user_data["name"] = tg_name
+
+        if client and client.get("phone"):
+            # Уже знаем телефон — сразу к подтверждению
+            ctx.user_data["phone"] = client["phone"]
             set_state(ctx, ST_CONFIRM)
             await q.edit_message_text(
                 confirm_text(ctx.user_data),
                 parse_mode="Markdown", reply_markup=kb_confirm())
         else:
-            set_state(ctx, ST_NAME)
+            # Просим поделиться номером через нативную кнопку Telegram
+            set_state(ctx, ST_PHONE)
             await q.edit_message_text(
-                "📝 Введите ваше *имя и фамилию:*", parse_mode="Markdown")
+                "📱 Для завершения записи нам нужен ваш номер телефона.\n\n"
+                "Нажмите кнопку ниже 👇")
+            await ctx.bot.send_message(
+                uid,
+                "Поделитесь номером одной кнопкой:",
+                reply_markup=kb_phone())
         return
 
     if data == "confirm_yes":
         d = ctx.user_data
         if not d.get("proc"):
-            await q.edit_message_text(
-                "⚠️ Сессия устарела. Начните запись заново.",
-                reply_markup=kb_main(uid))
+            await q.edit_message_text("⚠️ Сессия устарела. Начните заново.",
+                                       reply_markup=kb_main(uid))
             return
-        # Сохраняем в локальные переменные ДО очистки
         proc  = d["proc"];  date  = d["date"]
         time  = d["time"];  name  = d["name"]
         phone = d["phone"]; price = d["price"]
@@ -699,9 +837,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎉 *Вы записаны!*\n\n"
             f"💆 {proc}\n"
             f"📅 {fmt_date(date)} в {time}\n\n"
-            "Напомню за сутки и за 2 часа. 🔔\n\n"
+            "Напомню за сутки и за 2 часа до визита. 🔔\n\n"
             f"Вопросы: {MASTER_PHONE}",
-            parse_mode="Markdown", reply_markup=kb_back("main"))
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Мои записи", callback_data="my_apts"),
+                InlineKeyboardButton("◀️ В меню",     callback_data="main"),
+            ]]))
         return
 
     # ── Панель администратора ─────────────────────────────────────────────────
@@ -715,6 +857,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                    parse_mode="Markdown", reply_markup=kb_admin())
         return
 
+    if data == "adm_stats":
+        s = get_stats()
+        lines = [
+            "📊 *Статистика:*\n",
+            f"👥 Всего клиентов: {s['total_clients']}",
+            f"\n📅 Сегодня: {s['today_count']} зап. · {s['today_rev']:,} ₽".replace(",", " "),
+            f"📅 Неделя:  {s['week_count']} зап. · {s['week_rev']:,} ₽".replace(",", " "),
+            f"📅 Месяц:   {s['month_count']} зап. · {s['month_rev']:,} ₽".replace(",", " "),
+        ]
+        if s["top"]:
+            lines.append("\n🏆 *Топ процедуры:*")
+            for proc, cnt in s["top"]:
+                lines.append(f"  • {proc}: {cnt} раз")
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                                   reply_markup=kb_back("admin"))
+        return
+
     if data == "adm_sched":
         ctx.user_data["adm_action"] = "sched"
         await q.edit_message_text("📅 Выберите день:", reply_markup=kb_adm_dates(14, "adm_d"))
@@ -726,7 +885,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for i in range(7):
             d = (now + timedelta(days=i)).strftime("%Y-%m-%d")
             apts = day_apts(d)
-            fr = free_slots(d)
+            fr   = free_slots(d)
             lines.append(f"*{fmt_date(d)}*")
             for a in apts:
                 lines.append(f"  🕐 {a['time']} {a['name']} — {a['procedure']}")
@@ -776,7 +935,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "adm_cancel":
-        now = datetime.now()
+        now  = datetime.now()
         apts = []
         for i in range(30):
             apts.extend(day_apts((now + timedelta(days=i)).strftime("%Y-%m-%d")))
@@ -812,9 +971,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_admin())
         return
 
-    # Выбор даты в панели администратора
     if data.startswith("adm_d_"):
-        date = data[len("adm_d_"):]
+        date   = data[len("adm_d_"):]
         action = ctx.user_data.get("adm_action", "sched")
 
         if action == "sched":
@@ -826,9 +984,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if apts:
                 total = sum(a["price"] for a in apts)
                 for a in apts:
-                    lines.append(f"🕐 {a['time']}  {a['name']}  {a['phone']}\n"
-                                 f"   {a['procedure']} — {a['price']:,} ₽".replace(",", " "))
-                lines.append(f"\n💰 Итого: {total:,} ₽  •  {len(apts)} записей".replace(",", " "))
+                    lines.append(
+                        f"🕐 {a['time']}  {a['name']}  {a['phone']}\n"
+                        f"   {a['procedure']} — {a['price']:,} ₽".replace(",", " "))
+                lines.append(
+                    f"\n💰 Итого: {total:,} ₽  •  {len(apts)} записей".replace(",", " "))
             else:
                 lines.append("_Записей нет._")
             lines.append(f"\n🟢 Свободных слотов: {len(free_slots(date))}")
@@ -845,11 +1005,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "block":
-            ctx.user_data["adm_date"] = date
             statuses = all_slots_status(date)
             rows = []
             for t, s in statuses:
-                e = "🔴" if s == "booked" else ("🟡" if s == "blocked" else "🟢")
+                e  = "🔴" if s == "booked" else ("🟡" if s == "blocked" else "🟢")
                 cb = f"adm_blk_{date}|{t}" if s == "free" else "adm_noop"
                 rows.append([InlineKeyboardButton(f"{e} {t}", callback_data=cb)])
             rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
@@ -893,45 +1052,51 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         date, time = payload.split("|", 1)
         ctx.user_data["adm_date"] = date
         ctx.user_data["adm_time"] = time
-        await q.edit_message_text("💆 Выберите процедуру:", reply_markup=kb_procs())
         ctx.user_data["adm_action"] = "add_proc"
-        return
-
-    if data.startswith("proc_") and ctx.user_data.get("adm_action") == "add_proc":
-        idx = int(data[5:])
-        name, dur, price, _ = PROCEDURES[idx]
-        ctx.user_data.update(adm_proc=name, adm_dur=dur, adm_price=price)
-        set_state(ctx, ST_ADM_ADD_NAME)
-        await q.edit_message_text("👤 Введите имя клиента:")
+        await q.edit_message_text("💆 Выберите процедуру:", reply_markup=kb_procs())
         return
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
+# ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ И КОНТАКТА
 # ═══════════════════════════════════════════════════════════════════════════════
+
+async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Клиент поделился номером через нативную кнопку Telegram."""
+    contact = update.message.contact
+    phone   = contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    ctx.user_data["phone"] = phone
+
+    # Убираем Reply-клавиатуру
+    await update.message.reply_text(
+        f"✅ Номер получен: {phone}",
+        reply_markup=ReplyKeyboardRemove())
+
+    # Показываем подтверждение
+    set_state(ctx, ST_CONFIRM)
+    await update.message.reply_text(
+        confirm_text(ctx.user_data),
+        parse_mode="Markdown", reply_markup=kb_confirm())
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip()
     state = get_state(ctx)
     uid   = update.effective_user.id
 
-    # Ввод имени при записи
-    if state == ST_NAME:
-        if len(text) < 2:
-            await update.message.reply_text("Пожалуйста, введите настоящее имя.")
-            return
-        ctx.user_data["name"] = text
-        set_state(ctx, ST_PHONE)
-        await update.message.reply_text(
-            "📱 Введите ваш *номер телефона:*", parse_mode="Markdown")
-        return
-
-    # Ввод телефона при записи
+    # Ввод телефона вручную (если не захотел делиться через кнопку)
     if state == ST_PHONE:
         if not validate_phone(text):
             await update.message.reply_text(
-                "❌ Неверный формат. Пример: *+7 900 123-45-67*", parse_mode="Markdown")
+                "❌ Неверный формат. Введите номер или нажмите кнопку ниже 👇",
+                reply_markup=kb_phone())
             return
-        ctx.user_data["phone"] = text
+        phone = text
+        if not phone.startswith("+"):
+            phone = "+" + re.sub(r"\D", "", phone)
+            phone = "+7" + phone[2:] if phone.startswith("+8") else phone
+        ctx.user_data["phone"] = phone
+        await update.message.reply_text("✅ Номер принят.", reply_markup=ReplyKeyboardRemove())
         set_state(ctx, ST_CONFIRM)
         await update.message.reply_text(
             confirm_text(ctx.user_data),
@@ -967,10 +1132,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         set_state(ctx, ST_ADM)
         return
 
-    # Любое другое сообщение — показываем главное меню
-    await update.message.reply_text(
-        "Используйте кнопки меню 👇",
-        reply_markup=kb_main(uid))
+    # Любое другое сообщение
+    await update.message.reply_text("Используйте кнопки меню 👇",
+                                     reply_markup=kb_main(uid))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ЗАПУСК
@@ -990,6 +1154,8 @@ def main():
     app.add_handler(CommandHandler("about",   cmd_about))
     app.add_handler(CommandHandler("admin",   cmd_admin))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # Контакт должен быть зарегистрирован ДО текстового обработчика
+    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     if app.job_queue:
