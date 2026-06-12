@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 """
-PODOLOG BOT v3 — полная версия со всеми улучшениями.
+PODOLOG BOT — стабильная версия.
 Установка: pip install "python-telegram-bot[job-queue]"
-
-Новое в v3:
-  1. Перенос записи клиентом
-  2. Отзыв после визита (авто-запрос через день)
-  3. Защита от спама (rate limiting)
-  4. Рассылка всем клиентам из панели админа
-  5. Экспорт расписания /export
-  6. Бан клиента из панели админа
-  7. Загруженность дней в датапикере
-  8. Подтверждение записи мастером
 """
 
 import logging
@@ -21,10 +11,8 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-MOSCOW_TZ = ZoneInfo('Europe/Moscow')
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup,
@@ -54,7 +42,8 @@ MASTER_ABOUT  = (
     "Работаю аккуратно, без боли и стресса. 🌸"
 )
 
-WORK_DAYS  = [0, 1, 2, 3, 4, 5]   # пн–сб
+MOSCOW_TZ  = ZoneInfo("Europe/Moscow")
+WORK_DAYS  = [0, 1, 2, 3, 4, 5]
 WORK_START = 10
 WORK_END   = 20
 SLOT_MIN   = 60
@@ -62,12 +51,11 @@ DAYS_AHEAD = 14
 MAX_ACTIVE = 2
 DB_FILE    = "podolog.db"
 
-# Антиспам: максимум N нажатий за WINDOW секунд
 RATE_LIMIT_COUNT  = 5
 RATE_LIMIT_WINDOW = 10
 
 # Формат: (название, длительность мин, цена_от, цена_до, описание)
-# Если цена фиксированная — ставь цена_от == цена_до
+# Если цена фиксированная — цена_от == цена_до
 PROCEDURES = [
     ("Педикюр аппаратный",     60, 2800, 3500,
      "Профессиональная обработка стопы и пальцев, удаление натоптышей."),
@@ -83,12 +71,6 @@ PROCEDURES = [
      "Комплексная зачистка + подбор терапевтического ухода."),
 ]
 
-def fmt_price(price_from, price_to):
-    """Форматирует цену: 'от 2 800 ₽' или '2 200 ₽' если фиксированная."""
-    if price_from == price_to:
-        return f"{price_from:,} ₽".replace(",", " ")
-    return f"от {price_from:,} ₽".replace(",", " ")
-
 # Состояния
 ST_MAIN            = "main"
 ST_PROC            = "proc"
@@ -102,13 +84,6 @@ ST_ADM             = "adm"
 ST_ADM_ADD_NAME    = "adm_add_name"
 ST_ADM_ADD_PHONE   = "adm_add_phone"
 ST_ADM_BROADCAST   = "adm_broadcast"
-ST_ADM_PROC_NAME   = "adm_proc_name"
-ST_ADM_PROC_DUR    = "adm_proc_dur"
-ST_ADM_PROC_PF     = "adm_proc_pf"
-ST_ADM_PROC_PT     = "adm_proc_pt"
-ST_ADM_PROC_DESC   = "adm_proc_desc"
-ST_ADM_PROC_EDIT   = "adm_proc_edit"
-ST_ADM_PROC_PRICE  = "adm_proc_price" 
 
 MONTHS   = ["","января","февраля","марта","апреля","мая","июня",
             "июля","августа","сентября","октября","ноября","декабря"]
@@ -135,9 +110,7 @@ _rate_lock = threading.Lock()
 def is_rate_limited(uid: int) -> bool:
     now = time.time()
     with _rate_lock:
-        timestamps = _rate_data[uid]
-        # Убираем старые метки
-        _rate_data[uid] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        _rate_data[uid] = [t for t in _rate_data[uid] if now - t < RATE_LIMIT_WINDOW]
         if len(_rate_data[uid]) >= RATE_LIMIT_COUNT:
             return True
         _rate_data[uid].append(now)
@@ -156,13 +129,10 @@ def init_db():
     with _lock, _db() as c:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS appointments (
-                id        TEXT PRIMARY KEY,
-                date      TEXT, time TEXT,
-                name      TEXT, phone TEXT,
-                user_id   INTEGER,
+                id TEXT PRIMARY KEY, date TEXT, time TEXT,
+                name TEXT, phone TEXT, user_id INTEGER,
                 procedure TEXT, duration INTEGER, price INTEGER,
-                status    TEXT DEFAULT 'pending',
-                created   TEXT
+                status TEXT DEFAULT 'pending', created TEXT
             );
             CREATE TABLE IF NOT EXISTS blocked (
                 date TEXT, time TEXT, PRIMARY KEY(date,time)
@@ -171,48 +141,46 @@ def init_db():
                 date TEXT PRIMARY KEY, reason TEXT DEFAULT 'Выходной'
             );
             CREATE TABLE IF NOT EXISTS clients (
-                user_id   INTEGER PRIMARY KEY,
-                name      TEXT, phone TEXT,
-                last_proc TEXT,
-                visits    INTEGER DEFAULT 0,
-                is_banned INTEGER DEFAULT 0
+                user_id INTEGER PRIMARY KEY,
+                name TEXT, phone TEXT, last_proc TEXT,
+                visits INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS reviews (
-                apt_id    TEXT PRIMARY KEY,
-                user_id   INTEGER,
-                rating    INTEGER,
-                comment   TEXT,
-                created   TEXT
-            );
-            CREATE TABLE IF NOT EXISTS procedures (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT NOT NULL,
-                duration   INTEGER NOT NULL,
-                price_from INTEGER NOT NULL,
-                price_to   INTEGER NOT NULL,
-                description TEXT NOT NULL,
-                is_active  INTEGER DEFAULT 1,
-                sort_order INTEGER DEFAULT 0
+                apt_id TEXT PRIMARY KEY, user_id INTEGER,
+                rating INTEGER, comment TEXT, created TEXT
             );
         """)
-        # Заполняем procedures из PROCEDURES если таблица пустая
-        with _lock, _db() as c:
-            if c.execute("SELECT COUNT(*) FROM procedures").fetchone()[0] == 0:
-                for i, (name, dur, pf, pt, desc) in enumerate(PROCEDURES):
-                    c.execute(
-                        "INSERT INTO procedures(name,duration,price_from,price_to,description,sort_order) "
-                        "VALUES(?,?,?,?,?,?)",
-                        (name, dur, pf, pt, desc, i)
-                    )
-        # Миграции для старых БД
         for table, col, defn in [
-            ("appointments", "duration", "INTEGER DEFAULT 60"),
-            ("clients",      "is_banned","INTEGER DEFAULT 0"),
+            ("appointments", "duration",  "INTEGER DEFAULT 60"),
+            ("clients",      "is_banned", "INTEGER DEFAULT 0"),
         ]:
             try:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
             except Exception:
                 pass
+
+# ── Вспомогательные ──────────────────────────────────────────────────────────
+
+def today():
+    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+
+def fmt_date(d):
+    dt = datetime.strptime(d, "%Y-%m-%d")
+    return f"{WEEKDAYS[dt.weekday()]}, {dt.day} {MONTHS[dt.month]}"
+
+def fmt_price(pf, pt):
+    if pf == pt:
+        return f"{pf:,} ₽".replace(",", " ")
+    return f"от {pf:,} ₽".replace(",", " ")
+
+def validate_phone(p):
+    return 7 <= len(re.sub(r"\D", "", p)) <= 15
+
+def set_state(ctx, state):
+    ctx.user_data["state"] = state
+
+def get_state(ctx):
+    return ctx.user_data.get("state", ST_MAIN)
 
 # ── Клиенты ──────────────────────────────────────────────────────────────────
 
@@ -255,82 +223,28 @@ def get_all_client_ids():
         rows = c.execute("SELECT user_id FROM clients WHERE is_banned=0").fetchall()
     return [r["user_id"] for r in rows]
 
-# ── Процедуры (из БД) ────────────────────────────────────────────────────────
+# ── Отзывы ───────────────────────────────────────────────────────────────────
 
-def get_procedures(active_only=True):
-    with _lock, _db() as c:
-        if active_only:
-            rows = c.execute(
-                "SELECT * FROM procedures WHERE is_active=1 ORDER BY sort_order, id"
-            ).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT * FROM procedures ORDER BY sort_order, id"
-            ).fetchall()
-    return [dict(r) for r in rows]
-
-def get_procedure(proc_id):
-    with _lock, _db() as c:
-        row = c.execute("SELECT * FROM procedures WHERE id=?", (proc_id,)).fetchone()
-    return dict(row) if row else None
-
-def update_procedure(proc_id, **fields):
-    allowed = {"name","duration","price_from","price_to","description","is_active","sort_order"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
-        return
-    sql = ", ".join(f"{k}=?" for k in updates)
-    with _lock, _db() as c:
-        c.execute(f"UPDATE procedures SET {sql} WHERE id=?",
-                  (*updates.values(), proc_id))
-
-def add_procedure(name, duration, price_from, price_to, description):
-    with _lock, _db() as c:
-        c.execute(
-            "INSERT INTO procedures(name,duration,price_from,price_to,description,is_active) "
-            "VALUES(?,?,?,?,?,1)",
-            (name, duration, price_from, price_to, description)
-        )
-
-def delete_procedure(proc_id):
-    with _lock, _db() as c:
-        c.execute("DELETE FROM procedures WHERE id=?", (proc_id,))
-
-# ── Отзывы ────────────────────────────────────────────────────────────────────
-
-def save_review(apt_id, uid, rating, comment=""):
+def save_review(apt_id, uid, rating):
     with _lock, _db() as c:
         c.execute("""
-            INSERT OR REPLACE INTO reviews(apt_id,user_id,rating,comment,created)
-            VALUES(?,?,?,?,?)
-        """, (apt_id, uid, rating, comment,
-              datetime.now().strftime("%Y-%m-%d %H:%M")))
+            INSERT OR REPLACE INTO reviews(apt_id,user_id,rating,created)
+            VALUES(?,?,?,?)
+        """, (apt_id, uid, rating, datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")))
 
 def get_reviews_stats():
     with _lock, _db() as c:
-        row = c.execute(
-            "SELECT COUNT(*) cnt, ROUND(AVG(rating),1) avg FROM reviews"
-        ).fetchone()
+        row    = c.execute("SELECT COUNT(*) cnt, ROUND(AVG(rating),1) avg FROM reviews").fetchone()
         recent = c.execute(
-            "SELECT rating, comment, created FROM reviews "
-            "ORDER BY created DESC LIMIT 5"
+            "SELECT rating, created FROM reviews ORDER BY created DESC LIMIT 5"
         ).fetchall()
     return dict(row), [dict(r) for r in recent]
 
-# ── Слоты ────────────────────────────────────────────────────────────────────
-
-def today():
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
-
-def fmt_date(d):
-    dt = datetime.strptime(d, "%Y-%m-%d")
-    return f"{WEEKDAYS[dt.weekday()]}, {dt.day} {MONTHS[dt.month]}"
+# ── Слоты и расписание ───────────────────────────────────────────────────────
 
 def is_dayoff(date):
     with _lock, _db() as c:
-        return c.execute(
-            "SELECT 1 FROM dayoff WHERE date=?", (date,)
-        ).fetchone() is not None
+        return c.execute("SELECT 1 FROM dayoff WHERE date=?", (date,)).fetchone() is not None
 
 def toggle_dayoff(date):
     with _lock, _db() as c:
@@ -343,15 +257,13 @@ def toggle_dayoff(date):
 def _booked(date):
     with _lock, _db() as c:
         return {r["time"] for r in c.execute(
-            "SELECT time FROM appointments "
-            "WHERE date=? AND status NOT IN ('cancelled','rejected')", (date,)
+            "SELECT time FROM appointments WHERE date=? AND status NOT IN ('cancelled','rejected')",
+            (date,)
         )}
 
 def _blocked(date):
     with _lock, _db() as c:
-        return {r["time"] for r in c.execute(
-            "SELECT time FROM blocked WHERE date=?", (date,)
-        )}
+        return {r["time"] for r in c.execute("SELECT time FROM blocked WHERE date=?", (date,))}
 
 def free_slots(date):
     if is_dayoff(date):
@@ -374,14 +286,14 @@ def all_slots_status(date):
     result, t = [], WORK_START * 60
     while t + SLOT_MIN <= WORK_END * 60:
         hh, mm = divmod(t, 60)
-        s = f"{hh:02d}:{mm:02d}"
+        s  = f"{hh:02d}:{mm:02d}"
         st = "booked" if s in b else ("blocked" if s in bl else "free")
         result.append((s, st))
         t += SLOT_MIN
     return result
 
 def available_dates():
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
     if now.hour >= WORK_END:
         now += timedelta(days=1)
     dates, d = [], now
@@ -395,14 +307,28 @@ def available_dates():
         d += timedelta(days=1)
     return dates
 
+def all_blocked_slots():
+    with _lock, _db() as c:
+        rows = c.execute(
+            "SELECT date,time FROM blocked WHERE date>=? ORDER BY date,time", (today(),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def block_slot(date, time):
+    with _lock, _db() as c:
+        c.execute("INSERT OR IGNORE INTO blocked(date,time) VALUES(?,?)", (date, time))
+
+def unblock_slot(date, time):
+    with _lock, _db() as c:
+        c.execute("DELETE FROM blocked WHERE date=? AND time=?", (date, time))
+
 # ── Записи ───────────────────────────────────────────────────────────────────
 
 def add_apt(date, time, name, phone, uid, proc, dur, price):
     apt_id = f"{date}_{time.replace(':','')}_{uid}"
     with _lock, _db() as c:
         if c.execute(
-            "SELECT 1 FROM appointments WHERE date=? AND time=? "
-            "AND status NOT IN ('cancelled','rejected')",
+            "SELECT 1 FROM appointments WHERE date=? AND time=? AND status NOT IN ('cancelled','rejected')",
             (date, time)
         ).fetchone():
             raise ValueError("Этот слот уже занят — выберите другое время.")
@@ -411,7 +337,7 @@ def add_apt(date, time, name, phone, uid, proc, dur, price):
             "(id,date,time,name,phone,user_id,procedure,duration,price,status,created) "
             "VALUES(?,?,?,?,?,?,?,?,?,'pending',?)",
             (apt_id, date, time, name, phone, uid, proc, dur, price,
-             datetime.now().strftime("%Y-%m-%d %H:%M"))
+             datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"))
         )
     save_client(uid, name, phone)
     set_last_proc(uid, proc)
@@ -440,8 +366,8 @@ def reject_apt_by_admin(apt_id):
 def cancel_apt(apt_id):
     with _lock, _db() as c:
         row = c.execute(
-            "SELECT * FROM appointments WHERE id=? "
-            "AND status IN ('confirmed','pending')", (apt_id,)
+            "SELECT * FROM appointments WHERE id=? AND status IN ('confirmed','pending')",
+            (apt_id,)
         ).fetchone()
         if row:
             c.execute("UPDATE appointments SET status='cancelled' WHERE id=?", (apt_id,))
@@ -449,16 +375,14 @@ def cancel_apt(apt_id):
     return None
 
 def reschedule_apt(apt_id, new_date, new_time):
-    """Переносит запись. Возвращает (старая запись, новый apt_id)."""
     with _lock, _db() as c:
         row = c.execute(
-            "SELECT * FROM appointments WHERE id=? "
-            "AND status IN ('confirmed','pending')", (apt_id,)
+            "SELECT * FROM appointments WHERE id=? AND status IN ('confirmed','pending')",
+            (apt_id,)
         ).fetchone()
         if not row:
             return None, None
         apt = dict(row)
-        # Проверяем что новый слот свободен
         if c.execute(
             "SELECT 1 FROM appointments WHERE date=? AND time=? "
             "AND status NOT IN ('cancelled','rejected') AND id!=?",
@@ -473,15 +397,13 @@ def reschedule_apt(apt_id, new_date, new_time):
             "VALUES(?,?,?,?,?,?,?,?,?,'pending',?)",
             (new_id, new_date, new_time, apt["name"], apt["phone"],
              apt["user_id"], apt["procedure"], apt["duration"], apt["price"],
-             datetime.now().strftime("%Y-%m-%d %H:%M"))
+             datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"))
         )
     return apt, new_id
 
 def get_apt(apt_id):
     with _lock, _db() as c:
-        row = c.execute(
-            "SELECT * FROM appointments WHERE id=?", (apt_id,)
-        ).fetchone()
+        row = c.execute("SELECT * FROM appointments WHERE id=?", (apt_id,)).fetchone()
     return dict(row) if row else None
 
 def user_apts(uid):
@@ -510,26 +432,11 @@ def day_apts(date):
         ).fetchall()
     return [dict(r) for r in rows]
 
-def all_blocked_slots():
-    with _lock, _db() as c:
-        rows = c.execute(
-            "SELECT date,time FROM blocked WHERE date>=? ORDER BY date,time", (today(),)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-def block_slot(date, time):
-    with _lock, _db() as c:
-        c.execute("INSERT OR IGNORE INTO blocked(date,time) VALUES(?,?)", (date, time))
-
-def unblock_slot(date, time):
-    with _lock, _db() as c:
-        c.execute("DELETE FROM blocked WHERE date=? AND time=?", (date, time))
-
 def get_stats():
-    now         = datetime.now()
+    now         = datetime.now(MOSCOW_TZ)
+    today_str   = today()
     month_start = now.replace(day=1).strftime("%Y-%m-%d")
     week_start  = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-    today_str   = today()
     with _lock, _db() as c:
         def rev(start):
             row = c.execute(
@@ -547,9 +454,7 @@ def get_stats():
             "GROUP BY procedure ORDER BY cnt DESC LIMIT 3"
         ).fetchall()
         total_clients = c.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-        avg_rating    = c.execute(
-            "SELECT ROUND(AVG(rating),1) FROM reviews"
-        ).fetchone()[0]
+        avg_rating    = c.execute("SELECT ROUND(AVG(rating),1) FROM reviews").fetchone()[0]
     return dict(
         today_count=tc, today_rev=tr,
         week_count=wc,  week_rev=wr,
@@ -559,7 +464,7 @@ def get_stats():
     )
 
 def export_week():
-    now   = datetime.now()
+    now   = datetime.now(MOSCOW_TZ)
     lines = [f"📋 Расписание на 7 дней ({now.strftime('%d.%m.%Y')})\n"]
     total_rev = 0
     for i in range(7):
@@ -570,9 +475,9 @@ def export_week():
         lines.append(f"\n{'🚫 ' if off else ''}📅 {fmt_date(d)}")
         if apts:
             for a in apts:
-                status_icon = "✅" if a["status"] == "confirmed" else "⏳"
+                icon = "✅" if a["status"] == "confirmed" else "⏳"
                 lines.append(
-                    f"  {status_icon} {a['time']} {a['name']} — "
+                    f"  {icon} {a['time']} {a['name']} — "
                     f"{a['procedure']} ({a['price']:,} ₽)".replace(",", " ")
                 )
                 total_rev += a["price"]
@@ -583,18 +488,16 @@ def export_week():
     return "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# НАПОМИНАНИЯ И АВТО-ЗАДАЧИ
+# НАПОМИНАНИЯ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def schedule_reminders(app, apt_id, uid, date, time):
     if not app.job_queue:
         return
     try:
-        # Создаём время визита в московском часовом поясе
         naive_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
         apt_dt   = naive_dt.replace(tzinfo=MOSCOW_TZ)
         now_msk  = datetime.now(MOSCOW_TZ)
-
         for hours, label in [(24, "завтра"), (2, "через 2 часа")]:
             fire = apt_dt - timedelta(hours=hours)
             if fire > now_msk:
@@ -603,7 +506,6 @@ def schedule_reminders(app, apt_id, uid, date, time):
                     data={"apt_id": apt_id, "uid": uid, "label": label},
                     name=f"rem_{apt_id}_{hours}",
                 )
-        # Запрос отзыва — через 24 часа после визита
         review_fire = apt_dt + timedelta(hours=24)
         if review_fire > now_msk:
             app.job_queue.run_once(
@@ -617,12 +519,6 @@ def schedule_reminders(app, apt_id, uid, date, time):
 def cancel_reminders(app, apt_id):
     if not app.job_queue:
         return
-    for suffix in ("24", "2", ""):
-        name = f"rem_{apt_id}_{suffix}" if suffix else f"review_{apt_id}"
-        for j in app.job_queue.get_jobs_by_name(
-            f"rem_{apt_id}_{suffix}" if suffix else f"review_{apt_id}"
-        ):
-            j.schedule_removal()
     for h in (24, 2):
         for j in app.job_queue.get_jobs_by_name(f"rem_{apt_id}_{h}"):
             j.schedule_removal()
@@ -670,31 +566,6 @@ async def _ask_review(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("Ошибка запроса отзыва: %s", e)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def validate_phone(p):
-    return 7 <= len(re.sub(r"\D", "", p)) <= 15
-
-def set_state(ctx, state):
-    ctx.user_data["state"] = state
-
-def get_state(ctx):
-    return ctx.user_data.get("state", ST_MAIN)
-
-def confirm_text(d):
-    status_note = "\n\n⏳ _Ожидает подтверждения мастером_"
-    return (
-        "📋 *Подтвердите запись:*\n\n"
-        f"💆 {d['proc']}\n"
-        f"📅 {fmt_date(d['date'])} в {d['time']}\n"
-        f"⏱ {d['dur']} мин  •  💰 {d['price']:,} ₽\n\n".replace(",", " ") +
-        f"👤 {d['name']}\n"
-        f"📱 {d['phone']}"
-        f"{status_note}"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -702,12 +573,8 @@ def kb_main(uid):
     client = get_client(uid)
     rows   = []
     if client and client.get("last_proc"):
-        short = client["last_proc"]
-        if len(short) > 28:
-            short = short[:28] + "…"
-        rows.append([InlineKeyboardButton(
-            f"🔄 Повторить: {short}", callback_data="repeat"
-        )])
+        short = client["last_proc"][:28] + "…" if len(client["last_proc"]) > 28 else client["last_proc"]
+        rows.append([InlineKeyboardButton(f"🔄 Повторить: {short}", callback_data="repeat")])
     rows += [
         [InlineKeyboardButton("📅 Записаться",    callback_data="book"),
          InlineKeyboardButton("📋 Мои записи",    callback_data="my_apts")],
@@ -722,47 +589,27 @@ def kb_main(uid):
 def kb_back(cb="main"):
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=cb)]])
 
-def kb_procs(admin_mode=False):
-    procs = get_procedures(active_only=not admin_mode)
-    rows  = []
-    for p in procs:
-        if admin_mode:
-            icon  = "✅" if p["is_active"] else "❌"
-            label = f"{icon} {p['name']}  •  {fmt_price(p['price_from'],p['price_to'])}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"adm_proc_{p['id']}")])
-        else:
-            label = f"{p['name']}  •  {fmt_price(p['price_from'],p['price_to'])}  •  {p['duration']} мин"
-            rows.append([InlineKeyboardButton(label, callback_data=f"proc_{p['id']}")])
-    if admin_mode:
-        rows.append([InlineKeyboardButton("➕ Добавить процедуру", callback_data="adm_proc_new")])
-        rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-    else:
-        rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
+def kb_procs():
+    rows = [[InlineKeyboardButton(
+        f"{name}  •  {fmt_price(pf, pt)}  •  {dur} мин",
+        callback_data=f"proc_{i}"
+    )] for i, (name, dur, pf, pt, _) in enumerate(PROCEDURES)]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_dates(dates):
-    """Датапикер с показом загруженности."""
+    total = (WORK_END - WORK_START) * 60 // SLOT_MIN
     rows, row = [], []
     for d in dates:
-        dt    = datetime.strptime(d, "%Y-%m-%d")
-        free  = free_slots_count(d)
-        total = (WORK_END - WORK_START) * 60 // SLOT_MIN
-        # Индикатор загруженности
-        if free == total:
-            indicator = "🟢"
-        elif free > total // 2:
-            indicator = "🟡"
-        else:
-            indicator = "🔴"
-        label = f"{indicator} {dt.day} {MONTHS[dt.month][:3]} {WEEKDAYS[dt.weekday()]} ({free})"
+        dt   = datetime.strptime(d, "%Y-%m-%d")
+        free = free_slots_count(d)
+        ind  = "🟢" if free == total else ("🟡" if free > total // 2 else "🔴")
+        label = f"{ind} {dt.day} {MONTHS[dt.month][:3]} {WEEKDAYS[dt.weekday()]} ({free})"
         row.append(InlineKeyboardButton(label, callback_data=f"date_{d}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(
-        "🟢 много мест  🟡 мало  🔴 почти нет", callback_data="adm_noop"
-    )])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="book")])
     return InlineKeyboardMarkup(rows)
 
@@ -784,35 +631,26 @@ def kb_confirm():
     ]])
 
 def kb_my_apts(apts):
-    rows = []
-    for a in apts:
-        status = "⏳" if a["status"] == "pending" else "✅"
-        rows.append([
-            InlineKeyboardButton(
-                f"{status} {fmt_date(a['date'])} {a['time']} — {a['procedure'][:18]}",
-                callback_data=f"apt_detail_{a['id']}"
-            )
-        ])
+    rows = [[InlineKeyboardButton(
+        f"{'⏳' if a['status']=='pending' else '✅'} "
+        f"{fmt_date(a['date'])} {a['time']} — {a['procedure'][:18]}",
+        callback_data=f"apt_detail_{a['id']}"
+    )] for a in apts]
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_apt_detail(apt_id, status):
     rows = []
     if status in ("confirmed", "pending"):
-        rows.append([InlineKeyboardButton(
-            "📅 Перенести", callback_data=f"reschedule_{apt_id}"
-        )])
-        rows.append([InlineKeyboardButton(
-            "❌ Отменить", callback_data=f"cancel_{apt_id}"
-        )])
+        rows.append([InlineKeyboardButton("📅 Перенести", callback_data=f"reschedule_{apt_id}")])
+        rows.append([InlineKeyboardButton("❌ Отменить",  callback_data=f"cancel_{apt_id}")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="my_apts")])
     return InlineKeyboardMarkup(rows)
 
 def kb_phone():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
+        resize_keyboard=True, one_time_keyboard=True,
     )
 
 def kb_admin():
@@ -828,12 +666,11 @@ def kb_admin():
          InlineKeyboardButton("❌ Отменить запись",       callback_data="adm_cancel")],
         [InlineKeyboardButton("📢 Рассылка",             callback_data="adm_broadcast"),
          InlineKeyboardButton("🚷 Бан клиента",          callback_data="adm_ban")],
-        [InlineKeyboardButton("💆 Управление услугами",  callback_data="adm_procs")],
         [InlineKeyboardButton("◀️ Главное меню",         callback_data="main")],
     ])
 
 def kb_adm_dates(days=14, prefix="adm_d"):
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
     rows, row = [], []
     for i in range(days):
         d  = (now + timedelta(days=i)).strftime("%Y-%m-%d")
@@ -848,6 +685,17 @@ def kb_adm_dates(days=14, prefix="adm_d"):
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
     return InlineKeyboardMarkup(rows)
 
+def confirm_text(d):
+    return (
+        "📋 *Подтвердите запись:*\n\n"
+        f"💆 {d['proc']}\n"
+        f"📅 {fmt_date(d['date'])} в {d['time']}\n"
+        f"⏱ {d['dur']} мин  •  💰 {d['price']:,} ₽\n\n".replace(",", " ") +
+        f"👤 {d['name']}\n"
+        f"📱 {d['phone']}\n\n"
+        "_⏳ Ожидает подтверждения мастером_"
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ОБЩИЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -856,14 +704,13 @@ async def show_main(update, ctx):
     uid    = update.effective_user.id
     client = get_client(uid)
     set_state(ctx, ST_MAIN)
-    if client and client.get("visits", 0) > 1:
-        greeting = (f"С возвращением! 👋 Вы у нас уже {client['visits']} раз "
-                    f"— спасибо за доверие! 🌸")
-    else:
-        greeting = "Главное меню — выберите действие:"
+    greeting = (
+        f"С возвращением! 👋 Вы у нас уже {client['visits']} раз — спасибо! 🌸"
+        if client and client.get("visits", 0) > 1
+        else "Главное меню — выберите действие:"
+    )
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            greeting, reply_markup=kb_main(uid))
+        await update.callback_query.edit_message_text(greeting, reply_markup=kb_main(uid))
     else:
         await update.message.reply_text(greeting, reply_markup=kb_main(uid))
 
@@ -888,15 +735,8 @@ async def start_booking(update, ctx, proc_idx=None):
             await update.message.reply_text(text, reply_markup=kb)
         return
     if proc_idx is not None:
-        p = get_procedure(proc_idx)  # proc_idx теперь это id из БД
-        if not p:
-            # Запасной вариант — берём первую активную процедуру
-            procs = get_procedures()
-            if not procs:
-                await show_main(update, ctx)
-                return
-            p = procs[0]
-        ctx.user_data.update(proc=p["name"], dur=p["duration"], price=p["price_from"])
+        name, dur, pf, pt, desc = PROCEDURES[proc_idx]
+        ctx.user_data.update(proc=name, dur=dur, price=pf)
         dates = available_dates()
         if not dates:
             text = "😔 Свободных дат пока нет. Загляните позже."
@@ -906,22 +746,18 @@ async def start_booking(update, ctx, proc_idx=None):
                 await update.message.reply_text(text, reply_markup=kb_back())
             return
         set_state(ctx, ST_DATE)
-        text = f"✅ *{name}*\n_{desc}_\n\n📅 Выберите дату:"
+        text = f"✅ *{name}*\n_{desc}_\n💰 {fmt_price(pf,pt)}\n\n📅 Выберите дату:"
         if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=kb_dates(dates))
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_dates(dates))
         else:
-            await update.message.reply_text(
-                text, parse_mode="Markdown", reply_markup=kb_dates(dates))
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_dates(dates))
     else:
         set_state(ctx, ST_PROC)
         text = "💆 *Выберите процедуру:*"
         if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=kb_procs())
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_procs())
         else:
-            await update.message.reply_text(
-                text, parse_mode="Markdown", reply_markup=kb_procs())
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_procs())
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # КОМАНДЫ
@@ -934,16 +770,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     client = get_client(uid)
     set_state(ctx, ST_MAIN)
     if client:
-        text = (f"С возвращением, *{name}*! 👋\n\n"
-                f"Вы у нас уже {client['visits']} раз — спасибо за доверие! 🌸\n"
-                "Чем могу помочь?")
+        text = (f"С возвращением, *{name}*! 👋\n\nВы у нас уже {client['visits']} раз — спасибо! 🌸\nЧем могу помочь?")
     else:
-        text = (f"Привет, *{name}*! 👋\n\n"
-                f"Я помогу записаться к подологу *{MASTER_NAME}*.\n\n"
-                f"⭐ Рейтинг {MASTER_RATING}  •  Работает с {MASTER_SINCE} года\n\n"
-                "Выберите действие:")
-    await update.message.reply_text(
-        text, parse_mode="Markdown", reply_markup=kb_main(uid))
+        text = (f"Привет, *{name}*! 👋\n\nЯ помогу записаться к подологу *{MASTER_NAME}*.\n\n⭐ Рейтинг {MASTER_RATING}  •  Работает с {MASTER_SINCE} года\n\nВыберите действие:")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_main(uid))
 
 async def cmd_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await start_booking(update, ctx)
@@ -952,63 +782,42 @@ async def cmd_my_apts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     apts = user_apts(uid)
     if not apts:
-        await update.message.reply_text(
-            "У вас нет предстоящих записей.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📅 Записаться", callback_data="book"),
-            ]]))
-        return
+        await update.message.reply_text("У вас нет предстоящих записей.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📅 Записаться", callback_data="book")]])); return
     lines = ["📋 *Ваши записи:*\n"]
     for a in apts:
-        status = "⏳ ожидает подтвержд." if a["status"] == "pending" else "✅ подтверждена"
-        lines.append(
-            f"• {fmt_date(a['date'])} в {a['time']}\n"
-            f"  {a['procedure']} — {status}"
-        )
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=kb_my_apts(apts))
+        lines.append(f"• {fmt_date(a['date'])} в {a['time']} — {a['procedure']} ({'⏳' if a['status']=='pending' else '✅'})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_my_apts(apts))
 
 async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["💆 *Услуги и цены:*\n"]
     for name, dur, pf, pt, desc in PROCEDURES:
-        lines.append(
-            f"*{name}*\n"
-            f"⏱ {dur} мин  •  💰 {fmt_price(pf, pt)}\n" +
-            f"_{desc}_\n"
-        )
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
+        lines.append(f"*{name}*\n⏱ {dur} мин  •  💰 {fmt_price(pf,pt)}\n_{desc}_\n")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
 
 async def cmd_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📞 *Контакты:*\n\nТелефон: {MASTER_PHONE}\nTelegram: {MASTER_TG}\n\n"
-        f"Режим работы: пн–сб, {WORK_START}:00–{WORK_END}:00",
+        f"📞 *Контакты:*\n\nТелефон: {MASTER_PHONE}\nTelegram: {MASTER_TG}\n\nРежим работы: пн–сб, {WORK_START}:00–{WORK_END}:00",
         parse_mode="Markdown", reply_markup=kb_back())
 
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"👩‍⚕️ *{MASTER_NAME}*\n\n{MASTER_ABOUT}\n\n"
-        f"⭐ Рейтинг: {MASTER_RATING}\n"
-        f"📅 Принимает с {MASTER_SINCE} года",
+        f"👩‍⚕️ *{MASTER_NAME}*\n\n{MASTER_ABOUT}\n\n⭐ Рейтинг: {MASTER_RATING}\n📅 Принимает с {MASTER_SINCE} года",
         parse_mode="Markdown", reply_markup=kb_back())
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
-    await update.message.reply_text(
-        export_week(), parse_mode="Markdown", reply_markup=kb_back("admin"))
+        await update.message.reply_text("⛔ Нет доступа."); return
+    await update.message.reply_text(export_week(), parse_mode="Markdown", reply_markup=kb_back("admin"))
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
+        await update.message.reply_text("⛔ Нет доступа."); return
     set_state(ctx, ST_ADM)
-    await update.message.reply_text(
-        "🔐 *Панель мастера:*", parse_mode="Markdown", reply_markup=kb_admin())
+    await update.message.reply_text("🔐 *Панель мастера:*", parse_mode="Markdown", reply_markup=kb_admin())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# РОУТЕР КНОПОК
+# РОУТЕР
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1017,12 +826,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     uid  = update.effective_user.id
 
-    # Антиспам
     if is_rate_limited(uid):
         await q.answer("⏳ Не так быстро!", show_alert=True)
         return
 
-    # ── Главное меню ──────────────────────────────────────────────────────────
     if data == "main":
         ctx.user_data.clear()
         await show_main(update, ctx)
@@ -1031,50 +838,34 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "prices":
         lines = ["💆 *Услуги и цены:*\n"]
         for name, dur, pf, pt, desc in PROCEDURES:
-            lines.append(
-                f"*{name}*\n"
-                f"⏱ {dur} мин  •  💰 {fmt_price(pf, pt)}\n" +
-                f"_{desc}_\n"
-            )
-        await q.edit_message_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
+            lines.append(f"*{name}*\n⏱ {dur} мин  •  💰 {fmt_price(pf,pt)}\n_{desc}_\n")
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
         return
 
     if data == "about":
         await q.edit_message_text(
-            f"👩‍⚕️ *{MASTER_NAME}*\n\n{MASTER_ABOUT}\n\n"
-            f"⭐ Рейтинг: {MASTER_RATING}\n"
-            f"📅 Принимает с {MASTER_SINCE} года",
+            f"👩‍⚕️ *{MASTER_NAME}*\n\n{MASTER_ABOUT}\n\n⭐ Рейтинг: {MASTER_RATING}\n📅 Принимает с {MASTER_SINCE} года",
             parse_mode="Markdown", reply_markup=kb_back())
         return
 
     if data == "contact":
         await q.edit_message_text(
-            f"📞 *Контакты:*\n\nТелефон: {MASTER_PHONE}\nTelegram: {MASTER_TG}\n\n"
-            f"Режим работы: пн–сб, {WORK_START}:00–{WORK_END}:00",
+            f"📞 *Контакты:*\n\nТелефон: {MASTER_PHONE}\nTelegram: {MASTER_TG}\n\nРежим работы: пн–сб, {WORK_START}:00–{WORK_END}:00",
             parse_mode="Markdown", reply_markup=kb_back())
         return
 
-    # ── Мои записи ────────────────────────────────────────────────────────────
     if data == "my_apts":
         apts = user_apts(uid)
         if not apts:
-            await q.edit_message_text(
-                "У вас нет предстоящих записей.",
+            await q.edit_message_text("У вас нет предстоящих записей.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📅 Записаться", callback_data="book")],
-                    [InlineKeyboardButton("◀️ Назад",      callback_data="main")],
-                ]))
-            return
+                    [InlineKeyboardButton("◀️ Назад", callback_data="main")],
+                ])); return
         lines = ["📋 *Ваши записи:*\n"]
         for a in apts:
-            status = "⏳ ожидает" if a["status"] == "pending" else "✅"
-            lines.append(
-                f"• {fmt_date(a['date'])} в {a['time']}\n"
-                f"  {a['procedure']} — {status}"
-            )
-        await q.edit_message_text(
-            "\n".join(lines) + "\n\nВыберите запись:",
+            lines.append(f"• {fmt_date(a['date'])} в {a['time']} — {a['procedure']} ({'⏳' if a['status']=='pending' else '✅'})")
+        await q.edit_message_text("\n".join(lines) + "\n\nВыберите запись:",
             parse_mode="Markdown", reply_markup=kb_my_apts(apts))
         return
 
@@ -1082,17 +873,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         apt_id = data[len("apt_detail_"):]
         apt    = get_apt(apt_id)
         if not apt:
-            await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("my_apts"))
-            return
-        status_text = "⏳ Ожидает подтверждения мастером" if apt["status"] == "pending" else "✅ Подтверждена"
+            await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("my_apts")); return
+        status_text = "⏳ Ожидает подтверждения" if apt["status"] == "pending" else "✅ Подтверждена"
         await q.edit_message_text(
-            f"📋 *Детали записи:*\n\n"
-            f"💆 {apt['procedure']}\n"
-            f"📅 {fmt_date(apt['date'])} в {apt['time']}\n"
-            f"💰 {apt['price']:,} ₽\n\n".replace(",", " ") +
-            f"Статус: {status_text}",
-            parse_mode="Markdown",
-            reply_markup=kb_apt_detail(apt_id, apt["status"]))
+            f"📋 *Детали записи:*\n\n💆 {apt['procedure']}\n📅 {fmt_date(apt['date'])} в {apt['time']}\n💰 {apt['price']:,} ₽\n\nСтатус: {status_text}".replace(",", " "),
+            parse_mode="Markdown", reply_markup=kb_apt_detail(apt_id, apt["status"]))
         return
 
     if data.startswith("cancel_"):
@@ -1101,58 +886,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if apt:
             cancel_reminders(ctx.application, apt_id)
             try:
-                await ctx.bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ *Клиент отменил запись*\n\n"
-                    f"👤 {apt['name']}  📱 {apt['phone']}\n"
-                    f"💆 {apt['procedure']}\n"
-                    f"📅 {fmt_date(apt['date'])} в {apt['time']}",
+                await ctx.bot.send_message(ADMIN_ID,
+                    f"⚠️ *Клиент отменил запись*\n\n👤 {apt['name']}  📱 {apt['phone']}\n💆 {apt['procedure']}\n📅 {fmt_date(apt['date'])} в {apt['time']}",
                     parse_mode="Markdown")
-            except Exception:
-                pass
-            await q.edit_message_text(
-                f"✅ Запись на {fmt_date(apt['date'])} в {apt['time']} отменена.",
-                reply_markup=kb_back("main"))
+            except Exception: pass
+            await q.edit_message_text(f"✅ Запись на {fmt_date(apt['date'])} в {apt['time']} отменена.", reply_markup=kb_back("main"))
         else:
             await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("my_apts"))
         return
 
-    # ── Перенос записи ────────────────────────────────────────────────────────
     if data.startswith("reschedule_"):
         apt_id = data[len("reschedule_"):]
         ctx.user_data["reschedule_apt_id"] = apt_id
         dates  = available_dates()
         if not dates:
-            await q.edit_message_text(
-                "😔 Свободных дат нет.", reply_markup=kb_back("my_apts"))
-            return
+            await q.edit_message_text("😔 Свободных дат нет.", reply_markup=kb_back("my_apts")); return
         set_state(ctx, ST_RESCHEDULE_DATE)
-        await q.edit_message_text(
-            "📅 Выберите новую дату:", reply_markup=kb_dates(dates))
+        await q.edit_message_text("📅 Выберите новую дату:", reply_markup=kb_dates(dates))
         return
 
     if data.startswith("rdate_"):
         date   = data[6:]
-        slots  = free_slots(date)
         apt_id = ctx.user_data.get("reschedule_apt_id", "")
-        # Убираем текущий слот записи из занятых (чтобы можно было выбрать то же время)
+        slots  = free_slots(date)
         if not slots:
-            await q.edit_message_text(
-                "На этот день нет свободных слотов.",
-                reply_markup=kb_dates(available_dates()))
-            return
+            await q.edit_message_text("На этот день нет свободных слотов.", reply_markup=kb_dates(available_dates())); return
         ctx.user_data["reschedule_date"] = date
         set_state(ctx, ST_RESCHEDULE_TIME)
         rows, row = [], []
         for s in slots:
             row.append(InlineKeyboardButton(f"🕐 {s}", callback_data=f"rtime_{s}"))
-            if len(row) == 4:
-                rows.append(row); row = []
-        if row:
-            rows.append(row)
+            if len(row) == 4: rows.append(row); row = []
+        if row: rows.append(row)
         rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"reschedule_{apt_id}")])
-        await q.edit_message_text(
-            f"📅 *{fmt_date(date)}*\n\n🕐 Выберите новое время:",
+        await q.edit_message_text(f"📅 *{fmt_date(date)}*\n\n🕐 Выберите новое время:",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
         return
 
@@ -1163,158 +930,106 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             old_apt, new_id = reschedule_apt(apt_id, new_date, new_time)
         except ValueError as e:
-            await q.edit_message_text(str(e), reply_markup=kb_back("my_apts"))
-            return
+            await q.edit_message_text(str(e), reply_markup=kb_back("my_apts")); return
         if not old_apt:
-            await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("my_apts"))
-            return
+            await q.edit_message_text("Запись не найдена.", reply_markup=kb_back("my_apts")); return
         cancel_reminders(ctx.application, apt_id)
         schedule_reminders(ctx.application, new_id, uid, new_date, new_time)
         set_state(ctx, ST_MAIN)
-        # Уведомление администратору
         try:
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"🔄 *Клиент перенёс запись*\n\n"
-                f"👤 {old_apt['name']}  📱 {old_apt['phone']}\n"
-                f"💆 {old_apt['procedure']}\n"
-                f"Было: {fmt_date(old_apt['date'])} в {old_apt['time']}\n"
-                f"Стало: {fmt_date(new_date)} в {new_time}\n\n"
-                "Подтвердите новую дату:",
+            await ctx.bot.send_message(ADMIN_ID,
+                f"🔄 *Клиент перенёс запись*\n\n👤 {old_apt['name']}  📱 {old_apt['phone']}\n💆 {old_apt['procedure']}\nБыло: {fmt_date(old_apt['date'])} в {old_apt['time']}\nСтало: {fmt_date(new_date)} в {new_time}\n\nПодтвердите:",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{new_id}"),
                     InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{new_id}"),
-                ]]),
-                parse_mode="Markdown")
-        except Exception:
-            pass
+                ]]), parse_mode="Markdown")
+        except Exception: pass
         await q.edit_message_text(
-            f"🔄 *Запись перенесена!*\n\n"
-            f"📅 {fmt_date(new_date)} в {new_time}\n"
-            f"💆 {old_apt['procedure']}\n\n"
-            "⏳ Ожидает подтверждения мастером.",
+            f"🔄 *Запись перенесена!*\n\n📅 {fmt_date(new_date)} в {new_time}\n💆 {old_apt['procedure']}\n\n⏳ Ожидает подтверждения мастером.",
             parse_mode="Markdown", reply_markup=kb_back("main"))
         return
 
-    # ── Отзывы ────────────────────────────────────────────────────────────────
     if data.startswith("rev_"):
         parts  = data.split("_")
         rating = int(parts[-1])
         apt_id = "_".join(parts[1:-1])
         save_review(apt_id, uid, rating)
-        stars  = "⭐" * rating
         await q.edit_message_text(
-            f"{stars}\n\nСпасибо за оценку! Это помогает нам становиться лучше. 🌸\n\n"
-            f"Будем рады видеть вас снова!",
+            f"{'⭐' * rating}\n\nСпасибо за оценку! Рады видеть вас снова! 🌸",
             reply_markup=kb_back("main"))
-        # Уведомляем мастера
         try:
             apt = get_apt(apt_id)
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"⭐ *Новый отзыв!*\n\n"
-                f"Оценка: {'⭐' * rating}\n"
-                f"Клиент: {apt['name'] if apt else uid}\n"
-                f"Процедура: {apt['procedure'] if apt else '—'}",
+            await ctx.bot.send_message(ADMIN_ID,
+                f"⭐ *Новый отзыв!*\n\nОценка: {'⭐' * rating}\nКлиент: {apt['name'] if apt else uid}\nПроцедура: {apt['procedure'] if apt else '—'}",
                 parse_mode="Markdown")
-        except Exception:
-            pass
+        except Exception: pass
         return
 
-    # ── Запись ────────────────────────────────────────────────────────────────
     if data == "book":
-        await start_booking(update, ctx)
-        return
+        await start_booking(update, ctx); return
 
     if data == "repeat":
         client = get_client(uid)
         if client and client.get("last_proc"):
-            procs = get_procedures()
-            for p in procs:
-                if p["name"] == client["last_proc"]:
-                    await start_booking(update, ctx, proc_idx=p["id"])
-                    return
-        await start_booking(update, ctx)
-        return
+            for i, (name, *_) in enumerate(PROCEDURES):
+                if name == client["last_proc"]:
+                    await start_booking(update, ctx, proc_idx=i); return
+        await start_booking(update, ctx); return
 
     if data.startswith("proc_"):
         if ctx.user_data.get("adm_action") == "add_proc":
-            proc_id = int(data[5:])
-            p = get_procedure(proc_id)
-            if not p:
-                return
-            ctx.user_data.update(adm_proc=p["name"], adm_dur=p["duration"], adm_price=p["price_from"])
+            idx = int(data[5:])
+            name, dur, pf, pt, _ = PROCEDURES[idx]
+            ctx.user_data.update(adm_proc=name, adm_dur=dur, adm_price=pf)
             set_state(ctx, ST_ADM_ADD_NAME)
-            await q.edit_message_text("👤 Введите имя клиента:")
-            return
-        proc_id = int(data[5:])
-        p = get_procedure(proc_id)
-        if not p:
-            await q.edit_message_text("Процедура не найдена.", reply_markup=kb_back())
-            return
-        ctx.user_data.update(proc=p["name"], dur=p["duration"], price=p["price_from"])
+            await q.edit_message_text("👤 Введите имя клиента:"); return
+        idx = int(data[5:])
+        name, dur, pf, pt, desc = PROCEDURES[idx]
+        ctx.user_data.update(proc=name, dur=dur, price=pf)
         dates = available_dates()
         if not dates:
-            await q.edit_message_text(
-                "😔 Свободных дат нет.", reply_markup=kb_back())
-            return
+            await q.edit_message_text("😔 Свободных дат нет.", reply_markup=kb_back()); return
         set_state(ctx, ST_DATE)
         await q.edit_message_text(
-            f"✅ *{p['name']}*\n_{p['description']}_\n"
-            f"💰 {fmt_price(p['price_from'],p['price_to'])}\n\n📅 Выберите дату:",
-            parse_mode="Markdown", reply_markup=kb_dates(dates))
-        return
+            f"✅ *{name}*\n_{desc}_\n💰 {fmt_price(pf,pt)}\n\n📅 Выберите дату:",
+            parse_mode="Markdown", reply_markup=kb_dates(dates)); return
 
     if data == "back_date":
         dates = available_dates()
         set_state(ctx, ST_DATE)
         await q.edit_message_text(
             f"💆 *{ctx.user_data.get('proc','Процедура')}*\n\n📅 Выберите дату:",
-            parse_mode="Markdown", reply_markup=kb_dates(dates))
-        return
+            parse_mode="Markdown", reply_markup=kb_dates(dates)); return
 
     if data.startswith("date_"):
         date  = data[5:]
         slots = free_slots(date)
         if not slots:
-            await q.edit_message_text(
-                "На этот день нет свободных слотов.",
-                reply_markup=kb_dates(available_dates()))
-            return
+            await q.edit_message_text("На этот день нет свободных слотов.", reply_markup=kb_dates(available_dates())); return
         ctx.user_data["date"] = date
         set_state(ctx, ST_TIME)
-        await q.edit_message_text(
-            f"📅 *{fmt_date(date)}*\n\n🕐 Выберите время:",
-            parse_mode="Markdown", reply_markup=kb_times(slots))
-        return
+        await q.edit_message_text(f"📅 *{fmt_date(date)}*\n\n🕐 Выберите время:",
+            parse_mode="Markdown", reply_markup=kb_times(slots)); return
 
     if data.startswith("time_"):
         time   = data[5:]
         client = get_client(uid)
         ctx.user_data["time"] = time
-        ctx.user_data["name"] = update.effective_user.full_name or \
-                                 update.effective_user.first_name or "Клиент"
+        ctx.user_data["name"] = update.effective_user.full_name or update.effective_user.first_name or "Клиент"
         if client and client.get("phone"):
             ctx.user_data["phone"] = client["phone"]
             set_state(ctx, ST_CONFIRM)
-            await q.edit_message_text(
-                confirm_text(ctx.user_data),
-                parse_mode="Markdown", reply_markup=kb_confirm())
+            await q.edit_message_text(confirm_text(ctx.user_data), parse_mode="Markdown", reply_markup=kb_confirm())
         else:
             set_state(ctx, ST_PHONE)
-            await q.edit_message_text(
-                "📱 Для записи нужен ваш номер телефона.\n\nНажмите кнопку ниже 👇")
-            await ctx.bot.send_message(
-                uid, "Поделитесь номером:", reply_markup=kb_phone())
+            await q.edit_message_text("📱 Для записи нужен ваш номер телефона.\n\nНажмите кнопку ниже 👇")
+            await ctx.bot.send_message(uid, "Поделитесь номером:", reply_markup=kb_phone())
         return
 
     if data == "confirm_yes":
         d = ctx.user_data
         if not d.get("proc"):
-            await q.edit_message_text(
-                "⚠️ Сессия устарела. Начните заново.",
-                reply_markup=kb_main(uid))
-            return
+            await q.edit_message_text("⚠️ Сессия устарела. Начните заново.", reply_markup=kb_main(uid)); return
         proc  = d["proc"];  date  = d["date"]
         time  = d["time"];  name  = d["name"]
         phone = d["phone"]; price = d["price"]
@@ -1322,101 +1037,62 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             apt_id = add_apt(date, time, name, phone, uid, proc, dur, price)
         except ValueError as e:
-            await q.edit_message_text(str(e), reply_markup=kb_main(uid))
-            return
+            await q.edit_message_text(str(e), reply_markup=kb_main(uid)); return
         ctx.user_data.clear()
         set_state(ctx, ST_MAIN)
-        # Уведомление мастеру с кнопками подтверждения
         try:
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"🔔 *Новая заявка на запись!*\n\n"
-                f"👤 {name}  📱 {phone}\n"
-                f"💆 {proc}\n"
-                f"📅 {fmt_date(date)} в {time}\n"
-                f"💰 {price:,} ₽\n\n".replace(",", " ") +
-                "Подтвердите или отклоните:",
+            await ctx.bot.send_message(ADMIN_ID,
+                f"🔔 *Новая заявка!*\n\n👤 {name}  📱 {phone}\n💆 {proc}\n📅 {fmt_date(date)} в {time}\n💰 {price:,} ₽\n\nПодтвердите:".replace(",", " "),
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
                     InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
-                ]]),
-                parse_mode="Markdown")
-        except Exception:
-            pass
+                ]]), parse_mode="Markdown")
+        except Exception: pass
         await q.edit_message_text(
-            f"🎉 *Заявка отправлена!*\n\n"
-            f"💆 {proc}\n"
-            f"📅 {fmt_date(date)} в {time}\n\n"
-            "⏳ Мастер подтвердит запись в ближайшее время.\n"
-            f"Вопросы: {MASTER_PHONE}",
+            f"🎉 *Заявка отправлена!*\n\n💆 {proc}\n📅 {fmt_date(date)} в {time}\n\n⏳ Мастер подтвердит запись в ближайшее время.\nВопросы: {MASTER_PHONE}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📋 Мои записи", callback_data="my_apts"),
                 InlineKeyboardButton("◀️ В меню",     callback_data="main"),
-            ]]))
-        return
+            ]])); return
 
-    # ── Подтверждение / отклонение мастером ──────────────────────────────────
     if data.startswith("adm_ok_"):
-        if uid != ADMIN_ID:
-            await q.answer("⛔ Нет доступа.", show_alert=True)
-            return
+        if uid != ADMIN_ID: await q.answer("⛔", show_alert=True); return
         apt_id = data[len("adm_ok_"):]
         apt    = confirm_apt_by_admin(apt_id)
         if apt:
-            schedule_reminders(ctx.application, apt_id,
-                                apt["user_id"], apt["date"], apt["time"])
+            schedule_reminders(ctx.application, apt_id, apt["user_id"], apt["date"], apt["time"])
             try:
-                await ctx.bot.send_message(
-                    apt["user_id"],
-                    f"✅ *Запись подтверждена мастером!*\n\n"
-                    f"💆 {apt['procedure']}\n"
-                    f"📅 {fmt_date(apt['date'])} в {apt['time']}\n\n"
-                    "Напомню за сутки и за 2 часа. 🔔",
+                await ctx.bot.send_message(apt["user_id"],
+                    f"✅ *Запись подтверждена!*\n\n💆 {apt['procedure']}\n📅 {fmt_date(apt['date'])} в {apt['time']}\n\nНапомню за сутки и за 2 часа. 🔔",
                     parse_mode="Markdown")
-            except Exception:
-                pass
-            await q.edit_message_text(
-                f"✅ Запись подтверждена: {apt['name']} "
-                f"{fmt_date(apt['date'])} в {apt['time']}")
+            except Exception: pass
+            await q.edit_message_text(f"✅ Подтверждено: {apt['name']} {fmt_date(apt['date'])} в {apt['time']}")
         else:
             await q.edit_message_text("Запись уже обработана.")
         return
 
     if data.startswith("adm_rej_"):
-        if uid != ADMIN_ID:
-            await q.answer("⛔ Нет доступа.", show_alert=True)
-            return
+        if uid != ADMIN_ID: await q.answer("⛔", show_alert=True); return
         apt_id = data[len("adm_rej_"):]
         apt    = reject_apt_by_admin(apt_id)
         if apt:
             try:
-                await ctx.bot.send_message(
-                    apt["user_id"],
-                    f"❌ *К сожалению, запись отклонена*\n\n"
-                    f"💆 {apt['procedure']}\n"
-                    f"📅 {fmt_date(apt['date'])} в {apt['time']}\n\n"
-                    f"Свяжитесь с мастером для уточнения: {MASTER_PHONE}",
+                await ctx.bot.send_message(apt["user_id"],
+                    f"❌ *Запись отклонена*\n\n💆 {apt['procedure']}\n📅 {fmt_date(apt['date'])} в {apt['time']}\n\nСвяжитесь: {MASTER_PHONE}",
                     parse_mode="Markdown")
-            except Exception:
-                pass
-            await q.edit_message_text(
-                f"❌ Запись отклонена: {apt['name']} "
-                f"{fmt_date(apt['date'])} в {apt['time']}")
+            except Exception: pass
+            await q.edit_message_text(f"❌ Отклонено: {apt['name']} {fmt_date(apt['date'])} в {apt['time']}")
         else:
             await q.edit_message_text("Запись уже обработана.")
         return
 
-    # ── Панель администратора ─────────────────────────────────────────────────
     if uid != ADMIN_ID and data.startswith("adm"):
-        await q.answer("⛔ Нет доступа.", show_alert=True)
-        return
+        await q.answer("⛔ Нет доступа.", show_alert=True); return
 
     if data == "admin":
         set_state(ctx, ST_ADM)
-        await q.edit_message_text(
-            "🔐 *Панель мастера:*", parse_mode="Markdown", reply_markup=kb_admin())
-        return
+        await q.edit_message_text("🔐 *Панель мастера:*", parse_mode="Markdown", reply_markup=kb_admin()); return
 
     if data == "adm_stats":
         s = get_stats()
@@ -1424,96 +1100,68 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "📊 *Статистика:*\n",
             f"👥 Всего клиентов: {s['total_clients']}",
             f"⭐ Средняя оценка: {s['avg_rating']}",
-            f"\n📅 Сегодня: {s['today_count']} зап. · "
-            f"{s['today_rev']:,} ₽".replace(",", " "),
-            f"📅 Неделя:  {s['week_count']} зап. · "
-            f"{s['week_rev']:,} ₽".replace(",", " "),
-            f"📅 Месяц:   {s['month_count']} зап. · "
-            f"{s['month_rev']:,} ₽".replace(",", " "),
+            f"\n📅 Сегодня: {s['today_count']} зап. · {s['today_rev']:,} ₽".replace(",", " "),
+            f"📅 Неделя:  {s['week_count']} зап. · {s['week_rev']:,} ₽".replace(",", " "),
+            f"📅 Месяц:   {s['month_count']} зап. · {s['month_rev']:,} ₽".replace(",", " "),
         ]
         if s["top"]:
             lines.append("\n🏆 *Топ процедуры:*")
             for proc, cnt in s["top"]:
                 lines.append(f"  • {proc}: {cnt} раз")
-        await q.edit_message_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin"))
-        return
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin")); return
 
     if data == "adm_reviews":
         stats, recent = get_reviews_stats()
-        lines = [f"⭐ *Отзывы клиентов:*\n",
-                 f"Всего: {stats['cnt']}  •  Средняя: {stats['avg'] or '—'} ⭐\n"]
+        lines = [f"⭐ *Отзывы:*\n", f"Всего: {stats['cnt']}  •  Средняя: {stats['avg'] or '—'} ⭐\n"]
         for r in recent:
             lines.append(f"{'⭐' * r['rating']}  {r['created'][:10]}")
-        await q.edit_message_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin"))
-        return
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin")); return
 
     if data == "adm_sched":
         ctx.user_data["adm_action"] = "sched"
-        await q.edit_message_text("📅 Выберите день:", reply_markup=kb_adm_dates(14, "adm_d"))
-        return
+        await q.edit_message_text("📅 Выберите день:", reply_markup=kb_adm_dates(14, "adm_d")); return
 
     if data == "adm_week":
-        await q.edit_message_text(
-            export_week(), parse_mode="Markdown", reply_markup=kb_back("admin"))
-        return
+        await q.edit_message_text(export_week(), parse_mode="Markdown", reply_markup=kb_back("admin")); return
 
     if data == "adm_block":
         ctx.user_data["adm_action"] = "block"
-        await q.edit_message_text("🚫 Выберите дату:", reply_markup=kb_adm_dates(14, "adm_d"))
-        return
+        await q.edit_message_text("🚫 Выберите дату:", reply_markup=kb_adm_dates(14, "adm_d")); return
 
     if data == "adm_unblock":
         bl = all_blocked_slots()
         if not bl:
-            await q.edit_message_text("Нет заблокированных слотов.",
-                                       reply_markup=kb_back("admin"))
-            return
-        rows = [[InlineKeyboardButton(
-            f"🔓 {fmt_date(b['date'])} в {b['time']}",
-            callback_data=f"adm_unblk_{b['date']}|{b['time']}"
-        )] for b in bl]
+            await q.edit_message_text("Нет заблокированных слотов.", reply_markup=kb_back("admin")); return
+        rows = [[InlineKeyboardButton(f"🔓 {fmt_date(b['date'])} в {b['time']}", callback_data=f"adm_unblk_{b['date']}|{b['time']}")] for b in bl]
         rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-        await q.edit_message_text(
-            "🔓 Выберите слот:", reply_markup=InlineKeyboardMarkup(rows))
-        return
+        await q.edit_message_text("🔓 Выберите слот:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("adm_unblk_"):
-        payload = data[len("adm_unblk_"):]
-        d, t    = payload.split("|", 1)
+        d, t = data[len("adm_unblk_"):].split("|", 1)
         unblock_slot(d, t)
-        await q.edit_message_text(
-            f"✅ Слот {fmt_date(d)} в {t} разблокирован.", reply_markup=kb_admin())
-        return
+        await q.edit_message_text(f"✅ Слот {fmt_date(d)} в {t} разблокирован.", reply_markup=kb_admin()); return
 
     if data == "adm_dayoff":
         ctx.user_data["adm_action"] = "dayoff"
-        await q.edit_message_text("📵 Выберите день:", reply_markup=kb_adm_dates(30, "adm_d"))
-        return
+        await q.edit_message_text("📵 Выберите день:", reply_markup=kb_adm_dates(30, "adm_d")); return
 
     if data == "adm_add":
         ctx.user_data["adm_action"] = "add"
-        await q.edit_message_text("➕ Выберите дату:", reply_markup=kb_adm_dates(14, "adm_d"))
-        return
+        await q.edit_message_text("➕ Выберите дату:", reply_markup=kb_adm_dates(14, "adm_d")); return
 
     if data == "adm_cancel":
-        now  = datetime.now()
+        now  = datetime.now(MOSCOW_TZ)
         apts = []
         for i in range(30):
             apts.extend(day_apts((now + timedelta(days=i)).strftime("%Y-%m-%d")))
         if not apts:
-            await q.edit_message_text("Нет активных записей.", reply_markup=kb_back("admin"))
-            return
+            await q.edit_message_text("Нет активных записей.", reply_markup=kb_back("admin")); return
         rows = [[InlineKeyboardButton(
-            f"{'⏳' if a['status']=='pending' else '✅'} "
-            f"{a['date']} {a['time']} — {a['name']}",
+            f"{'⏳' if a['status']=='pending' else '✅'} {a['date']} {a['time']} — {a['name']}",
             callback_data=f"adm_cncl_{a['id']}"
         )] for a in apts]
         rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-        await q.edit_message_text(
-            "❌ Выберите запись:", reply_markup=InlineKeyboardMarkup(rows))
-        return
+        await q.edit_message_text("❌ Выберите запись:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("adm_cncl_"):
         apt_id = data[len("adm_cncl_"):]
@@ -1521,35 +1169,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if apt:
             cancel_reminders(ctx.application, apt_id)
             try:
-                await ctx.bot.send_message(
-                    apt["user_id"],
-                    f"⚠️ *Ваша запись отменена мастером*\n\n"
-                    f"📅 {fmt_date(apt['date'])} в {apt['time']}\n"
-                    f"💆 {apt['procedure']}\n\n"
-                    f"Свяжитесь: {MASTER_PHONE}",
+                await ctx.bot.send_message(apt["user_id"],
+                    f"⚠️ *Ваша запись отменена мастером*\n\n📅 {fmt_date(apt['date'])} в {apt['time']}\n💆 {apt['procedure']}\n\nСвяжитесь: {MASTER_PHONE}",
                     parse_mode="Markdown")
-            except Exception:
-                pass
-            await q.edit_message_text(
-                f"✅ Запись {apt['name']} отменена. Клиент уведомлён.",
-                reply_markup=kb_admin())
-        return
+            except Exception: pass
+            await q.edit_message_text(f"✅ Запись {apt['name']} отменена.", reply_markup=kb_admin()); return
 
     if data == "adm_broadcast":
         set_state(ctx, ST_ADM_BROADCAST)
-        await q.edit_message_text(
-            "📢 Введите текст рассылки.\n\n"
-            "Сообщение получат все клиенты бота.\n"
-            "Для отмены напишите /admin")
-        return
+        await q.edit_message_text("📢 Введите текст рассылки.\nДля отмены напишите /admin"); return
 
     if data == "adm_ban":
-        ctx.user_data["adm_action"] = "ban"
-        now  = datetime.now()
+        now  = datetime.now(MOSCOW_TZ)
         apts = []
         for i in range(30):
             apts.extend(day_apts((now + timedelta(days=i)).strftime("%Y-%m-%d")))
-        # Уникальные клиенты
         seen, rows = set(), []
         for a in apts:
             if a["user_id"] not in seen:
@@ -1560,56 +1194,43 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     callback_data=f"adm_toggle_ban_{a['user_id']}"
                 )])
         if not rows:
-            await q.edit_message_text("Нет клиентов.", reply_markup=kb_back("admin"))
-            return
+            await q.edit_message_text("Нет клиентов.", reply_markup=kb_back("admin")); return
         rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-        await q.edit_message_text(
-            "🚷 Выберите клиента для бана/разбана:\n🚫 — заблокирован  👤 — активен",
-            reply_markup=InlineKeyboardMarkup(rows))
-        return
+        await q.edit_message_text("🚷 Выберите клиента:\n🚫 — заблокирован  👤 — активен",
+            reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("adm_toggle_ban_"):
         ban_uid = int(data[len("adm_toggle_ban_"):])
         result  = toggle_ban(ban_uid)
-        msg     = "🚫 Клиент заблокирован." if result == "banned" else "✅ Клиент разблокирован."
-        await q.edit_message_text(msg, reply_markup=kb_admin())
-        return
+        await q.edit_message_text(
+            "🚫 Клиент заблокирован." if result == "banned" else "✅ Клиент разблокирован.",
+            reply_markup=kb_admin()); return
 
     if data.startswith("adm_d_"):
         date   = data[len("adm_d_"):]
         action = ctx.user_data.get("adm_action", "sched")
 
         if action == "sched":
-            apts = day_apts(date)
-            off  = is_dayoff(date)
+            apts  = day_apts(date)
+            off   = is_dayoff(date)
             lines = [f"📅 *{fmt_date(date)}*\n"]
-            if off:
-                lines.append("🚫 Выходной день\n")
+            if off: lines.append("🚫 Выходной день\n")
             if apts:
                 total = sum(a["price"] for a in apts)
                 for a in apts:
                     icon = "⏳" if a["status"] == "pending" else "✅"
-                    lines.append(
-                        f"{icon} {a['time']}  {a['name']}  {a['phone']}\n"
-                        f"   {a['procedure']} — "
-                        f"{a['price']:,} ₽".replace(",", " "))
-                lines.append(
-                    f"\n💰 Итого: {total:,} ₽  •  "
-                    f"{len(apts)} записей".replace(",", " "))
+                    lines.append(f"{icon} {a['time']}  {a['name']}  {a['phone']}\n   {a['procedure']} — {a['price']:,} ₽".replace(",", " "))
+                lines.append(f"\n💰 Итого: {total:,} ₽  •  {len(apts)} записей".replace(",", " "))
             else:
                 lines.append("_Записей нет._")
             lines.append(f"\n🟢 Свободных слотов: {free_slots_count(date)}")
-            await q.edit_message_text(
-                "\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin"))
-            return
+            await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back("admin")); return
 
         if action == "dayoff":
             result = toggle_dayoff(date)
-            msg    = (f"🚫 {fmt_date(date)} — добавлен как выходной."
-                      if result == "added"
-                      else f"✅ {fmt_date(date)} — убран из выходных.")
-            await q.edit_message_text(msg, reply_markup=kb_admin())
-            return
+            await q.edit_message_text(
+                f"🚫 {fmt_date(date)} — добавлен как выходной." if result == "added" else f"✅ {fmt_date(date)} — убран из выходных.",
+                reply_markup=kb_admin()); return
 
         if action == "block":
             statuses = all_slots_status(date)
@@ -1619,349 +1240,104 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 cb = f"adm_blk_{date}|{t}" if s == "free" else "adm_noop"
                 rows.append([InlineKeyboardButton(f"{e} {t}", callback_data=cb)])
             rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-            await q.edit_message_text(
-                f"*{fmt_date(date)}*\n🟢 свободен  🟡 заблокирован  🔴 занят",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-            return
+            await q.edit_message_text(f"*{fmt_date(date)}*\n🟢 свободен  🟡 заблокирован  🔴 занят",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows)); return
 
         if action == "add":
             ctx.user_data["adm_date"] = date
             slots = free_slots(date)
             if not slots:
-                await q.edit_message_text(
-                    "Нет свободных слотов.", reply_markup=kb_back("admin"))
-                return
+                await q.edit_message_text("Нет свободных слотов.", reply_markup=kb_back("admin")); return
             rows, row = [], []
             for s in slots:
-                row.append(InlineKeyboardButton(
-                    s, callback_data=f"adm_addt_{date}|{s}"))
-                if len(row) == 4:
-                    rows.append(row); row = []
-            if row:
-                rows.append(row)
+                row.append(InlineKeyboardButton(s, callback_data=f"adm_addt_{date}|{s}"))
+                if len(row) == 4: rows.append(row); row = []
+            if row: rows.append(row)
             rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
-            await q.edit_message_text(
-                f"🕐 Выберите время на {fmt_date(date)}:",
-                reply_markup=InlineKeyboardMarkup(rows))
-            return
+            await q.edit_message_text(f"🕐 Выберите время на {fmt_date(date)}:",
+                reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("adm_blk_"):
-        payload    = data[len("adm_blk_"):]
-        date, time = payload.split("|", 1)
+        date, time = data[len("adm_blk_"):].split("|", 1)
         block_slot(date, time)
-        await q.edit_message_text(
-            f"🚫 Слот {fmt_date(date)} в {time} заблокирован.",
-            reply_markup=kb_admin())
-        return
+        await q.edit_message_text(f"🚫 Слот {fmt_date(date)} в {time} заблокирован.", reply_markup=kb_admin()); return
 
     if data == "adm_noop":
         return
 
-    # ── Управление процедурами ───────────────────────────────────────────────
-    if data == "adm_procs":
-        if uid != ADMIN_ID:
-            await q.answer("⛔ Нет доступа.", show_alert=True)
-            return
-        await q.edit_message_text(
-            "💆 *Управление услугами:*\n\n✅ — активна  ❌ — скрыта\nНажмите на услугу для редактирования:",
-            parse_mode="Markdown",
-            reply_markup=kb_procs(admin_mode=True))
-        return
-
-    if data.startswith("adm_proc_"):
-        if uid != ADMIN_ID:
-            await q.answer("⛔ Нет доступа.", show_alert=True)
-            return
-        suffix = data[len("adm_proc_"):]
-
-        if suffix == "new":
-            ctx.user_data["adm_proc_action"] = "new"
-            set_state(ctx, ST_ADM_PROC_NAME)
-            await q.edit_message_text(
-                "➕ *Новая услуга*\n\nВведите название:")
-            return
-
-        proc_id = int(suffix)
-        p       = get_procedure(proc_id)
-        if not p:
-            await q.edit_message_text("Услуга не найдена.", reply_markup=kb_back("adm_procs"))
-            return
-
-        ctx.user_data["adm_edit_proc_id"] = proc_id
-        status = "✅ Активна" if p["is_active"] else "❌ Скрыта"
-        text = (
-            f"💆 *{p['name']}*\n\n"
-            f"⏱ {p['duration']} мин\n"
-            f"💰 {fmt_price(p['price_from'], p['price_to'])}\n"
-            f"_{p['description']}_\n\n"
-            f"Статус: {status}"
-        )
-        await q.edit_message_text(
-            text, parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Цена от",      callback_data=f"adm_pe_pf_{proc_id}"),
-                 InlineKeyboardButton("✏️ Цена до",      callback_data=f"adm_pe_pt_{proc_id}")],
-                [InlineKeyboardButton("✏️ Длительность", callback_data=f"adm_pe_dur_{proc_id}"),
-                 InlineKeyboardButton("✏️ Название",     callback_data=f"adm_pe_name_{proc_id}")],
-                [InlineKeyboardButton("✏️ Описание",     callback_data=f"adm_pe_desc_{proc_id}")],
-                [InlineKeyboardButton(
-                    "❌ Скрыть" if p["is_active"] else "✅ Показать",
-                    callback_data=f"adm_pe_toggle_{proc_id}"
-                )],
-                [InlineKeyboardButton("🗑 Удалить",      callback_data=f"adm_pe_del_{proc_id}")],
-                [InlineKeyboardButton("◀️ Назад",        callback_data="adm_procs")],
-            ]))
-        return
-
-    if data.startswith("adm_pe_"):
-        if uid != ADMIN_ID:
-            await q.answer("⛔ Нет доступа.", show_alert=True)
-            return
-        rest = data[len("adm_pe_"):]
-
-        # Переключение активности
-        if rest.startswith("toggle_"):
-            proc_id = int(rest[len("toggle_"):])
-            p       = get_procedure(proc_id)
-            if p:
-                update_procedure(proc_id, is_active=0 if p["is_active"] else 1)
-                status = "скрыта" if p["is_active"] else "активирована"
-                await q.edit_message_text(
-                    f"{'❌' if p['is_active'] else '✅'} Услуга «{p['name']}» {status}.",
-                    reply_markup=kb_back("adm_procs"))
-            return
-
-        # Удаление
-        if rest.startswith("del_"):
-            proc_id = int(rest[len("del_"):])
-            p       = get_procedure(proc_id)
-            if p:
-                delete_procedure(proc_id)
-                await q.edit_message_text(
-                    f"🗑 Услуга «{p['name']}» удалена.",
-                    reply_markup=kb_back("adm_procs"))
-            return
-
-        # Редактирование полей — запрашиваем новое значение текстом
-        field_map = {
-            "pf_":   ("price_from", "💰 Введите новую цену ОТ (число):"),
-            "pt_":   ("price_to",   "💰 Введите новую цену ДО (число, или равную 'от' если фиксированная):"),
-            "dur_":  ("duration",   "⏱ Введите длительность в минутах (число):"),
-            "name_": ("name",       "✏️ Введите новое название:"),
-            "desc_": ("description","✏️ Введите новое описание:"),
-        }
-        for prefix, (field, prompt) in field_map.items():
-            if rest.startswith(prefix):
-                proc_id = int(rest[len(prefix):])
-                ctx.user_data["adm_edit_proc_id"] = proc_id
-                ctx.user_data["adm_edit_field"]   = field
-                set_state(ctx, ST_ADM_PROC_EDIT)
-                await q.edit_message_text(prompt)
-                return
-        return
-
     if data.startswith("adm_addt_"):
-        payload    = data[len("adm_addt_"):]
-        date, time = payload.split("|", 1)
+        date, time = data[len("adm_addt_"):].split("|", 1)
         ctx.user_data["adm_date"]   = date
         ctx.user_data["adm_time"]   = time
         ctx.user_data["adm_action"] = "add_proc"
-        await q.edit_message_text("💆 Выберите процедуру:", reply_markup=kb_procs())
-        return
+        await q.edit_message_text("💆 Выберите процедуру:", reply_markup=kb_procs()); return
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ОБРАБОТЧИК КОНТАКТА И ТЕКСТА
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    phone   = contact.phone_number
-    if not phone.startswith("+"):
-        phone = "+" + phone
+    phone = update.message.contact.phone_number
+    if not phone.startswith("+"): phone = "+" + phone
     ctx.user_data["phone"] = phone
-    await update.message.reply_text(
-        f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
     set_state(ctx, ST_CONFIRM)
-    await update.message.reply_text(
-        confirm_text(ctx.user_data),
-        parse_mode="Markdown", reply_markup=kb_confirm())
+    await update.message.reply_text(confirm_text(ctx.user_data), parse_mode="Markdown", reply_markup=kb_confirm())
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip()
     state = get_state(ctx)
     uid   = update.effective_user.id
 
-    # Антиспам на текстовые сообщения
     if is_rate_limited(uid):
-        await update.message.reply_text("⏳ Не так быстро!")
-        return
+        await update.message.reply_text("⏳ Не так быстро!"); return
 
     if state == ST_PHONE:
         if not validate_phone(text):
-            await update.message.reply_text(
-                "❌ Неверный формат. Нажмите кнопку ниже 👇",
-                reply_markup=kb_phone())
-            return
+            await update.message.reply_text("❌ Неверный формат. Нажмите кнопку ниже 👇", reply_markup=kb_phone()); return
         phone = re.sub(r"\D", "", text)
-        if phone.startswith("8"):
-            phone = "7" + phone[1:]
+        if phone.startswith("8"): phone = "7" + phone[1:]
         phone = "+" + phone
         ctx.user_data["phone"] = phone
-        await update.message.reply_text(
-            "✅ Номер принят.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("✅ Номер принят.", reply_markup=ReplyKeyboardRemove())
         set_state(ctx, ST_CONFIRM)
-        await update.message.reply_text(
-            confirm_text(ctx.user_data),
-            parse_mode="Markdown", reply_markup=kb_confirm())
-        return
-
-    # Редактирование поля существующей процедуры
-    if state == ST_ADM_PROC_EDIT:
-        field   = ctx.user_data.get("adm_edit_field")
-        proc_id = ctx.user_data.get("adm_edit_proc_id")
-        p       = get_procedure(proc_id) if proc_id else None
-        if not p:
-            await update.message.reply_text("Ошибка: услуга не найдена.", reply_markup=kb_admin())
-            set_state(ctx, ST_ADM)
-            return
-        if field in ("price_from", "price_to", "duration"):
-            if not text.isdigit() or int(text) <= 0:
-                await update.message.reply_text("❌ Введите положительное число:")
-                return
-            update_procedure(proc_id, **{field: int(text)})
-        else:
-            if len(text.strip()) < 2:
-                await update.message.reply_text("❌ Слишком коротко, введите ещё раз:")
-                return
-            update_procedure(proc_id, **{field: text.strip()})
-        p = get_procedure(proc_id)
-        await update.message.reply_text(
-            f"✅ Услуга обновлена!\n\n"
-            f"*{p['name']}*\n"
-            f"⏱ {p['duration']} мин  •  💰 {fmt_price(p['price_from'],p['price_to'])}\n"
-            f"_{p['description']}_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ К списку услуг", callback_data="adm_procs")],
-                [InlineKeyboardButton("◀️ Панель",         callback_data="admin")],
-            ]))
-        set_state(ctx, ST_ADM)
-        return
-
-    # Создание новой процедуры — пошаговый ввод
-    if state == ST_ADM_PROC_NAME:
-        if len(text.strip()) < 2:
-            await update.message.reply_text("❌ Слишком коротко. Введите название:")
-            return
-        ctx.user_data["adm_new_name"] = text.strip()
-        set_state(ctx, ST_ADM_PROC_DUR)
-        await update.message.reply_text("⏱ Введите длительность в минутах (например: 60):")
-        return
-
-    if state == ST_ADM_PROC_DUR:
-        if not text.isdigit() or int(text) <= 0:
-            await update.message.reply_text("❌ Введите число минут:")
-            return
-        ctx.user_data["adm_new_dur"] = int(text)
-        set_state(ctx, ST_ADM_PROC_PF)
-        await update.message.reply_text("💰 Введите цену ОТ (число, в рублях):")
-        return
-
-    if state == ST_ADM_PROC_PF:
-        if not text.isdigit() or int(text) <= 0:
-            await update.message.reply_text("❌ Введите число:")
-            return
-        ctx.user_data["adm_new_pf"] = int(text)
-        set_state(ctx, ST_ADM_PROC_PT)
-        await update.message.reply_text(
-            "💰 Введите цену ДО (или повторите цену ОТ если фиксированная):")
-        return
-
-    if state == ST_ADM_PROC_PT:
-        if not text.isdigit() or int(text) <= 0:
-            await update.message.reply_text("❌ Введите число:")
-            return
-        ctx.user_data["adm_new_pt"] = int(text)
-        set_state(ctx, ST_ADM_PROC_DESC)
-        await update.message.reply_text("📝 Введите описание услуги:")
-        return
-
-    if state == ST_ADM_PROC_DESC:
-        if len(text.strip()) < 5:
-            await update.message.reply_text("❌ Слишком коротко. Введите описание:")
-            return
-        d = ctx.user_data
-        add_procedure(
-            d["adm_new_name"], d["adm_new_dur"],
-            d["adm_new_pf"],   d["adm_new_pt"],
-            text.strip()
-        )
-        await update.message.reply_text(
-            f"✅ Услуга добавлена!\n\n"
-            f"*{d['adm_new_name']}*\n"
-            f"⏱ {d['adm_new_dur']} мин  •  💰 {fmt_price(d['adm_new_pf'], d['adm_new_pt'])}\n"
-            f"_{text.strip()}_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💆 К списку услуг", callback_data="adm_procs")],
-                [InlineKeyboardButton("◀️ Панель",         callback_data="admin")],
-            ]))
-        set_state(ctx, ST_ADM)
-        return
+        await update.message.reply_text(confirm_text(ctx.user_data), parse_mode="Markdown", reply_markup=kb_confirm()); return
 
     if state == ST_ADM_ADD_NAME:
         ctx.user_data["adm_name"] = text
         set_state(ctx, ST_ADM_ADD_PHONE)
-        await update.message.reply_text("📱 Введите телефон клиента:")
-        return
+        await update.message.reply_text("📱 Введите телефон клиента:"); return
 
     if state == ST_ADM_ADD_PHONE:
         if not validate_phone(text):
-            await update.message.reply_text("❌ Неверный формат. Введите ещё раз:")
-            return
+            await update.message.reply_text("❌ Неверный формат. Введите ещё раз:"); return
         d = ctx.user_data
         try:
-            apt_id = add_apt(
-                d["adm_date"], d["adm_time"], d["adm_name"], text,
-                ADMIN_ID, d["adm_proc"], d["adm_dur"], d["adm_price"]
-            )
-            # Автоподтверждение для записей от администратора
+            apt_id = add_apt(d["adm_date"], d["adm_time"], d["adm_name"], text,
+                             ADMIN_ID, d["adm_proc"], d["adm_dur"], d["adm_price"])
             confirm_apt_by_admin(apt_id)
         except ValueError as e:
             await update.message.reply_text(str(e), reply_markup=kb_admin())
-            set_state(ctx, ST_ADM)
-            return
+            set_state(ctx, ST_ADM); return
         await update.message.reply_text(
-            f"✅ *Запись создана:*\n\n"
-            f"👤 {d['adm_name']}  📱 {text}\n"
-            f"💆 {d['adm_proc']}\n"
-            f"📅 {fmt_date(d['adm_date'])} в {d['adm_time']}",
+            f"✅ *Запись создана:*\n\n👤 {d['adm_name']}  📱 {text}\n💆 {d['adm_proc']}\n📅 {fmt_date(d['adm_date'])} в {d['adm_time']}",
             parse_mode="Markdown", reply_markup=kb_admin())
-        set_state(ctx, ST_ADM)
-        return
+        set_state(ctx, ST_ADM); return
 
     if state == ST_ADM_BROADCAST:
         uids = get_all_client_ids()
         sent, failed = 0, 0
-        await update.message.reply_text(
-            f"📢 Отправляю рассылку {len(uids)} клиентам...")
+        await update.message.reply_text(f"📢 Отправляю {len(uids)} клиентам...")
         for cid in uids:
             try:
-                await ctx.bot.send_message(
-                    cid,
-                    f"📢 *Сообщение от мастера {MASTER_NAME}:*\n\n{text}",
-                    parse_mode="Markdown")
+                await ctx.bot.send_message(cid, f"📢 *Сообщение от мастера {MASTER_NAME}:*\n\n{text}", parse_mode="Markdown")
                 sent += 1
             except Exception:
                 failed += 1
         set_state(ctx, ST_ADM)
-        await update.message.reply_text(
-            f"✅ Рассылка завершена.\nОтправлено: {sent}  •  Ошибок: {failed}",
-            reply_markup=kb_admin())
-        return
+        await update.message.reply_text(f"✅ Готово. Отправлено: {sent}  •  Ошибок: {failed}", reply_markup=kb_admin()); return
 
-    await update.message.reply_text(
-        "Используйте кнопки меню 👇", reply_markup=kb_main(uid))
+    await update.message.reply_text("Используйте кнопки меню 👇", reply_markup=kb_main(uid))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ЗАПУСК
@@ -1969,7 +1345,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-
     persistence = PicklePersistence(filepath="podolog_data")
     app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
@@ -1986,7 +1361,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     if app.job_queue:
-        log.info("Напоминания и отзывы активны ✅")
+        log.info("Напоминания активны ✅")
     else:
         log.warning('pip install "python-telegram-bot[job-queue]"')
 
