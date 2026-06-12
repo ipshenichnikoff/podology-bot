@@ -66,20 +66,28 @@ DB_FILE    = "podolog.db"
 RATE_LIMIT_COUNT  = 5
 RATE_LIMIT_WINDOW = 10
 
+# Формат: (название, длительность мин, цена_от, цена_до, описание)
+# Если цена фиксированная — ставь цена_от == цена_до
 PROCEDURES = [
-    ("Педикюр аппаратный",     60, 2800,
-     "Профессиональная обработка стопы и пальцев, удаление натоптышей."),
-    ("Гигиенический педикюр",  45, 2200,
+    ("ЗАЧИСТКА НОГТЕВОЙ ПЛАСТИНЫ",     60, 900, 1500,
+     "Цена зависит от степени повреждения, зачистка пораженной части ногтя до полного его отрастания."),
+    ("Гигиенический педикюр",  45, 2200, 2200,
      "Базовый уход: придание формы ногтям, лёгкая обработка кожи стопы."),
-    ("Лечение вросшего ногтя", 90, 3500,
+    ("Лечение вросшего ногтя", 90, 3500, 4500,
      "Безболезненное устранение проблемы. Облегчение уже за 1 сеанс."),
-    ("Протезирование ногтя",   90, 4500,
+    ("Протезирование ногтя",   90, 4500, 4500,
      "Восстановление эстетического вида ногтевой пластины гелем."),
-    ("Ортониксия (скобы)",     60, 5200,
+    ("Ортониксия (скобы)",     60, 5200, 6500,
      "Коррекция формы ногтя — титановая нить, скоба."),
-    ("Лечение грибка (микоз)", 60, 3200,
+    ("Лечение грибка (микоз)", 60, 3200, 3200,
      "Комплексная зачистка + подбор терапевтического ухода."),
 ]
+
+def fmt_price(price_from, price_to):
+    """Форматирует цену: 'от 2 800 ₽' или '2 200 ₽' если фиксированная."""
+    if price_from == price_to:
+        return f"{price_from:,} ₽".replace(",", " ")
+    return f"от {price_from:,} ₽".replace(",", " ")
 
 # Состояния
 ST_MAIN            = "main"
@@ -94,6 +102,13 @@ ST_ADM             = "adm"
 ST_ADM_ADD_NAME    = "adm_add_name"
 ST_ADM_ADD_PHONE   = "adm_add_phone"
 ST_ADM_BROADCAST   = "adm_broadcast"
+ST_ADM_PROC_NAME   = "adm_proc_name"
+ST_ADM_PROC_DUR    = "adm_proc_dur"
+ST_ADM_PROC_PF     = "adm_proc_pf"
+ST_ADM_PROC_PT     = "adm_proc_pt"
+ST_ADM_PROC_DESC   = "adm_proc_desc"
+ST_ADM_PROC_EDIT   = "adm_proc_edit"
+ST_ADM_PROC_PRICE  = "adm_proc_price" 
 
 MONTHS   = ["","января","февраля","марта","апреля","мая","июня",
             "июля","августа","сентября","октября","ноября","декабря"]
@@ -169,7 +184,26 @@ def init_db():
                 comment   TEXT,
                 created   TEXT
             );
+            CREATE TABLE IF NOT EXISTS procedures (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                duration   INTEGER NOT NULL,
+                price_from INTEGER NOT NULL,
+                price_to   INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                is_active  INTEGER DEFAULT 1,
+                sort_order INTEGER DEFAULT 0
+            );
         """)
+        # Заполняем procedures из PROCEDURES если таблица пустая
+        with _lock, _db() as c:
+            if c.execute("SELECT COUNT(*) FROM procedures").fetchone()[0] == 0:
+                for i, (name, dur, pf, pt, desc) in enumerate(PROCEDURES):
+                    c.execute(
+                        "INSERT INTO procedures(name,duration,price_from,price_to,description,sort_order) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (name, dur, pf, pt, desc, i)
+                    )
         # Миграции для старых БД
         for table, col, defn in [
             ("appointments", "duration", "INTEGER DEFAULT 60"),
@@ -220,6 +254,47 @@ def get_all_client_ids():
     with _lock, _db() as c:
         rows = c.execute("SELECT user_id FROM clients WHERE is_banned=0").fetchall()
     return [r["user_id"] for r in rows]
+
+# ── Процедуры (из БД) ────────────────────────────────────────────────────────
+
+def get_procedures(active_only=True):
+    with _lock, _db() as c:
+        if active_only:
+            rows = c.execute(
+                "SELECT * FROM procedures WHERE is_active=1 ORDER BY sort_order, id"
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM procedures ORDER BY sort_order, id"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_procedure(proc_id):
+    with _lock, _db() as c:
+        row = c.execute("SELECT * FROM procedures WHERE id=?", (proc_id,)).fetchone()
+    return dict(row) if row else None
+
+def update_procedure(proc_id, **fields):
+    allowed = {"name","duration","price_from","price_to","description","is_active","sort_order"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    sql = ", ".join(f"{k}=?" for k in updates)
+    with _lock, _db() as c:
+        c.execute(f"UPDATE procedures SET {sql} WHERE id=?",
+                  (*updates.values(), proc_id))
+
+def add_procedure(name, duration, price_from, price_to, description):
+    with _lock, _db() as c:
+        c.execute(
+            "INSERT INTO procedures(name,duration,price_from,price_to,description,is_active) "
+            "VALUES(?,?,?,?,?,1)",
+            (name, duration, price_from, price_to, description)
+        )
+
+def delete_procedure(proc_id):
+    with _lock, _db() as c:
+        c.execute("DELETE FROM procedures WHERE id=?", (proc_id,))
 
 # ── Отзывы ────────────────────────────────────────────────────────────────────
 
@@ -647,12 +722,22 @@ def kb_main(uid):
 def kb_back(cb="main"):
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=cb)]])
 
-def kb_procs():
-    rows = [[InlineKeyboardButton(
-        f"{name}  •  {price:,} ₽  •  {dur} мин".replace(",", " "),
-        callback_data=f"proc_{i}"
-    )] for i, (name, dur, price, _) in enumerate(PROCEDURES)]
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
+def kb_procs(admin_mode=False):
+    procs = get_procedures(active_only=not admin_mode)
+    rows  = []
+    for p in procs:
+        if admin_mode:
+            icon  = "✅" if p["is_active"] else "❌"
+            label = f"{icon} {p['name']}  •  {fmt_price(p['price_from'],p['price_to'])}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"adm_proc_{p['id']}")])
+        else:
+            label = f"{p['name']}  •  {fmt_price(p['price_from'],p['price_to'])}  •  {p['duration']} мин"
+            rows.append([InlineKeyboardButton(label, callback_data=f"proc_{p['id']}")])
+    if admin_mode:
+        rows.append([InlineKeyboardButton("➕ Добавить процедуру", callback_data="adm_proc_new")])
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin")])
+    else:
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_dates(dates):
@@ -743,6 +828,7 @@ def kb_admin():
          InlineKeyboardButton("❌ Отменить запись",       callback_data="adm_cancel")],
         [InlineKeyboardButton("📢 Рассылка",             callback_data="adm_broadcast"),
          InlineKeyboardButton("🚷 Бан клиента",          callback_data="adm_ban")],
+        [InlineKeyboardButton("💆 Управление услугами",  callback_data="adm_procs")],
         [InlineKeyboardButton("◀️ Главное меню",         callback_data="main")],
     ])
 
@@ -802,8 +888,15 @@ async def start_booking(update, ctx, proc_idx=None):
             await update.message.reply_text(text, reply_markup=kb)
         return
     if proc_idx is not None:
-        name, dur, price, desc = PROCEDURES[proc_idx]
-        ctx.user_data.update(proc=name, dur=dur, price=price)
+        p = get_procedure(proc_idx)  # proc_idx теперь это id из БД
+        if not p:
+            # Запасной вариант — берём первую активную процедуру
+            procs = get_procedures()
+            if not procs:
+                await show_main(update, ctx)
+                return
+            p = procs[0]
+        ctx.user_data.update(proc=p["name"], dur=p["duration"], price=p["price_from"])
         dates = available_dates()
         if not dates:
             text = "😔 Свободных дат пока нет. Загляните позже."
@@ -877,10 +970,10 @@ async def cmd_my_apts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["💆 *Услуги и цены:*\n"]
-    for name, dur, price, desc in PROCEDURES:
+    for name, dur, pf, pt, desc in PROCEDURES:
         lines.append(
             f"*{name}*\n"
-            f"⏱ {dur} мин  •  💰 {price:,} ₽\n".replace(",", " ") +
+            f"⏱ {dur} мин  •  💰 {fmt_price(pf, pt)}\n" +
             f"_{desc}_\n"
         )
     await update.message.reply_text(
@@ -937,10 +1030,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "prices":
         lines = ["💆 *Услуги и цены:*\n"]
-        for name, dur, price, desc in PROCEDURES:
+        for name, dur, pf, pt, desc in PROCEDURES:
             lines.append(
                 f"*{name}*\n"
-                f"⏱ {dur} мин  •  💰 {price:,} ₽\n".replace(",", " ") +
+                f"⏱ {dur} мин  •  💰 {fmt_price(pf, pt)}\n" +
                 f"_{desc}_\n"
             )
         await q.edit_message_text(
@@ -1136,24 +1229,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "repeat":
         client = get_client(uid)
         if client and client.get("last_proc"):
-            for i, (name, *_) in enumerate(PROCEDURES):
-                if name == client["last_proc"]:
-                    await start_booking(update, ctx, proc_idx=i)
+            procs = get_procedures()
+            for p in procs:
+                if p["name"] == client["last_proc"]:
+                    await start_booking(update, ctx, proc_idx=p["id"])
                     return
         await start_booking(update, ctx)
         return
 
     if data.startswith("proc_"):
         if ctx.user_data.get("adm_action") == "add_proc":
-            idx = int(data[5:])
-            name, dur, price, _ = PROCEDURES[idx]
-            ctx.user_data.update(adm_proc=name, adm_dur=dur, adm_price=price)
+            proc_id = int(data[5:])
+            p = get_procedure(proc_id)
+            if not p:
+                return
+            ctx.user_data.update(adm_proc=p["name"], adm_dur=p["duration"], adm_price=p["price_from"])
             set_state(ctx, ST_ADM_ADD_NAME)
             await q.edit_message_text("👤 Введите имя клиента:")
             return
-        idx = int(data[5:])
-        name, dur, price, desc = PROCEDURES[idx]
-        ctx.user_data.update(proc=name, dur=dur, price=price)
+        proc_id = int(data[5:])
+        p = get_procedure(proc_id)
+        if not p:
+            await q.edit_message_text("Процедура не найдена.", reply_markup=kb_back())
+            return
+        ctx.user_data.update(proc=p["name"], dur=p["duration"], price=p["price_from"])
         dates = available_dates()
         if not dates:
             await q.edit_message_text(
@@ -1161,7 +1260,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         set_state(ctx, ST_DATE)
         await q.edit_message_text(
-            f"✅ *{name}*\n_{desc}_\n\n📅 Выберите дату:",
+            f"✅ *{p['name']}*\n_{p['description']}_\n"
+            f"💰 {fmt_price(p['price_from'],p['price_to'])}\n\n📅 Выберите дату:",
             parse_mode="Markdown", reply_markup=kb_dates(dates))
         return
 
@@ -1557,6 +1657,109 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "adm_noop":
         return
 
+    # ── Управление процедурами ───────────────────────────────────────────────
+    if data == "adm_procs":
+        if uid != ADMIN_ID:
+            await q.answer("⛔ Нет доступа.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "💆 *Управление услугами:*\n\n✅ — активна  ❌ — скрыта\nНажмите на услугу для редактирования:",
+            parse_mode="Markdown",
+            reply_markup=kb_procs(admin_mode=True))
+        return
+
+    if data.startswith("adm_proc_"):
+        if uid != ADMIN_ID:
+            await q.answer("⛔ Нет доступа.", show_alert=True)
+            return
+        suffix = data[len("adm_proc_"):]
+
+        if suffix == "new":
+            ctx.user_data["adm_proc_action"] = "new"
+            set_state(ctx, ST_ADM_PROC_NAME)
+            await q.edit_message_text(
+                "➕ *Новая услуга*\n\nВведите название:")
+            return
+
+        proc_id = int(suffix)
+        p       = get_procedure(proc_id)
+        if not p:
+            await q.edit_message_text("Услуга не найдена.", reply_markup=kb_back("adm_procs"))
+            return
+
+        ctx.user_data["adm_edit_proc_id"] = proc_id
+        status = "✅ Активна" if p["is_active"] else "❌ Скрыта"
+        text = (
+            f"💆 *{p['name']}*\n\n"
+            f"⏱ {p['duration']} мин\n"
+            f"💰 {fmt_price(p['price_from'], p['price_to'])}\n"
+            f"_{p['description']}_\n\n"
+            f"Статус: {status}"
+        )
+        await q.edit_message_text(
+            text, parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Цена от",      callback_data=f"adm_pe_pf_{proc_id}"),
+                 InlineKeyboardButton("✏️ Цена до",      callback_data=f"adm_pe_pt_{proc_id}")],
+                [InlineKeyboardButton("✏️ Длительность", callback_data=f"adm_pe_dur_{proc_id}"),
+                 InlineKeyboardButton("✏️ Название",     callback_data=f"adm_pe_name_{proc_id}")],
+                [InlineKeyboardButton("✏️ Описание",     callback_data=f"adm_pe_desc_{proc_id}")],
+                [InlineKeyboardButton(
+                    "❌ Скрыть" if p["is_active"] else "✅ Показать",
+                    callback_data=f"adm_pe_toggle_{proc_id}"
+                )],
+                [InlineKeyboardButton("🗑 Удалить",      callback_data=f"adm_pe_del_{proc_id}")],
+                [InlineKeyboardButton("◀️ Назад",        callback_data="adm_procs")],
+            ]))
+        return
+
+    if data.startswith("adm_pe_"):
+        if uid != ADMIN_ID:
+            await q.answer("⛔ Нет доступа.", show_alert=True)
+            return
+        rest = data[len("adm_pe_"):]
+
+        # Переключение активности
+        if rest.startswith("toggle_"):
+            proc_id = int(rest[len("toggle_"):])
+            p       = get_procedure(proc_id)
+            if p:
+                update_procedure(proc_id, is_active=0 if p["is_active"] else 1)
+                status = "скрыта" if p["is_active"] else "активирована"
+                await q.edit_message_text(
+                    f"{'❌' if p['is_active'] else '✅'} Услуга «{p['name']}» {status}.",
+                    reply_markup=kb_back("adm_procs"))
+            return
+
+        # Удаление
+        if rest.startswith("del_"):
+            proc_id = int(rest[len("del_"):])
+            p       = get_procedure(proc_id)
+            if p:
+                delete_procedure(proc_id)
+                await q.edit_message_text(
+                    f"🗑 Услуга «{p['name']}» удалена.",
+                    reply_markup=kb_back("adm_procs"))
+            return
+
+        # Редактирование полей — запрашиваем новое значение текстом
+        field_map = {
+            "pf_":   ("price_from", "💰 Введите новую цену ОТ (число):"),
+            "pt_":   ("price_to",   "💰 Введите новую цену ДО (число, или равную 'от' если фиксированная):"),
+            "dur_":  ("duration",   "⏱ Введите длительность в минутах (число):"),
+            "name_": ("name",       "✏️ Введите новое название:"),
+            "desc_": ("description","✏️ Введите новое описание:"),
+        }
+        for prefix, (field, prompt) in field_map.items():
+            if rest.startswith(prefix):
+                proc_id = int(rest[len(prefix):])
+                ctx.user_data["adm_edit_proc_id"] = proc_id
+                ctx.user_data["adm_edit_field"]   = field
+                set_state(ctx, ST_ADM_PROC_EDIT)
+                await q.edit_message_text(prompt)
+                return
+        return
+
     if data.startswith("adm_addt_"):
         payload    = data[len("adm_addt_"):]
         date, time = payload.split("|", 1)
@@ -1610,6 +1813,104 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             confirm_text(ctx.user_data),
             parse_mode="Markdown", reply_markup=kb_confirm())
+        return
+
+    # Редактирование поля существующей процедуры
+    if state == ST_ADM_PROC_EDIT:
+        field   = ctx.user_data.get("adm_edit_field")
+        proc_id = ctx.user_data.get("adm_edit_proc_id")
+        p       = get_procedure(proc_id) if proc_id else None
+        if not p:
+            await update.message.reply_text("Ошибка: услуга не найдена.", reply_markup=kb_admin())
+            set_state(ctx, ST_ADM)
+            return
+        if field in ("price_from", "price_to", "duration"):
+            if not text.isdigit() or int(text) <= 0:
+                await update.message.reply_text("❌ Введите положительное число:")
+                return
+            update_procedure(proc_id, **{field: int(text)})
+        else:
+            if len(text.strip()) < 2:
+                await update.message.reply_text("❌ Слишком коротко, введите ещё раз:")
+                return
+            update_procedure(proc_id, **{field: text.strip()})
+        p = get_procedure(proc_id)
+        await update.message.reply_text(
+            f"✅ Услуга обновлена!\n\n"
+            f"*{p['name']}*\n"
+            f"⏱ {p['duration']} мин  •  💰 {fmt_price(p['price_from'],p['price_to'])}\n"
+            f"_{p['description']}_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ К списку услуг", callback_data="adm_procs")],
+                [InlineKeyboardButton("◀️ Панель",         callback_data="admin")],
+            ]))
+        set_state(ctx, ST_ADM)
+        return
+
+    # Создание новой процедуры — пошаговый ввод
+    if state == ST_ADM_PROC_NAME:
+        if len(text.strip()) < 2:
+            await update.message.reply_text("❌ Слишком коротко. Введите название:")
+            return
+        ctx.user_data["adm_new_name"] = text.strip()
+        set_state(ctx, ST_ADM_PROC_DUR)
+        await update.message.reply_text("⏱ Введите длительность в минутах (например: 60):")
+        return
+
+    if state == ST_ADM_PROC_DUR:
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text("❌ Введите число минут:")
+            return
+        ctx.user_data["adm_new_dur"] = int(text)
+        set_state(ctx, ST_ADM_PROC_PF)
+        await update.message.reply_text("💰 Введите цену ОТ (число, в рублях):")
+        return
+
+    if state == ST_ADM_PROC_PF:
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text("❌ Введите число:")
+            return
+        ctx.user_data["adm_new_pf"] = int(text)
+        set_state(ctx, ST_ADM_PROC_PT)
+        await update.message.reply_text(
+            "💰 Введите цену ДО (или повторите цену ОТ если фиксированная):")
+        return
+
+    if state == ST_ADM_PROC_PT:
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text("❌ Введите число:")
+            return
+        ctx.user_data["adm_new_pt"] = int(text)
+        set_state(ctx, ST_ADM_PROC_DESC)
+        await update.message.reply_text("📝 Введите описание услуги:")
+        return
+
+    if state == ST_ADM_PROC_DESC:
+        if len(text.strip()) < 5:
+            await update.message.reply_text("❌ Слишком коротко. Введите описание:")
+            return
+        d = ctx.user_data
+        add_procedure(
+            d["adm_new_name"], d["adm_new_dur"],
+            d["adm_new_pf"],   d["adm_new_pt"],
+            text.strip()
+        )
+        await update.message.reply_text(
+            f"✅ Услуга добавлена!
+
+"
+            f"*{d['adm_new_name']}*
+"
+            f"⏱ {d['adm_new_dur']} мин  •  💰 {fmt_price(d['adm_new_pf'], d['adm_new_pt'])}
+"
+            f"_{text.strip()}_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💆 К списку услуг", callback_data="adm_procs")],
+                [InlineKeyboardButton("◀️ Панель",         callback_data="admin")],
+            ]))
+        set_state(ctx, ST_ADM)
         return
 
     if state == ST_ADM_ADD_NAME:
