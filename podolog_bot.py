@@ -149,6 +149,15 @@ def init_db():
                 apt_id TEXT PRIMARY KEY, user_id INTEGER,
                 rating INTEGER, comment TEXT, created TEXT
             );
+            CREATE TABLE IF NOT EXISTS reminders (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                apt_id    TEXT NOT NULL,
+                user_id   INTEGER NOT NULL,
+                fire_time TEXT NOT NULL,
+                type      TEXT NOT NULL,
+                label     TEXT DEFAULT '',
+                sent      INTEGER DEFAULT 0
+            );
         """)
         for table, col, defn in [
             ("appointments", "duration",  "INTEGER DEFAULT 60"),
@@ -492,78 +501,89 @@ def export_week():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def schedule_reminders(app, apt_id, uid, date, time):
-    if not app.job_queue:
-        return
+    """Сохраняет напоминания в БД — работает даже после перезапуска бота."""
     try:
         naive_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
         apt_dt   = naive_dt.replace(tzinfo=MOSCOW_TZ)
         now_msk  = datetime.now(MOSCOW_TZ)
-        for hours, label in [(24, "завтра"), (2, "через 2 часа")]:
-            fire = apt_dt - timedelta(hours=hours)
-            if fire > now_msk:
-                app.job_queue.run_once(
-                    _remind, when=fire,
-                    data={"apt_id": apt_id, "uid": uid, "label": label},
-                    name=f"rem_{apt_id}_{hours}",
+        with _lock, _db() as c:
+            for hours, label in [(24, "завтра"), (2, "через 2 часа")]:
+                fire = apt_dt - timedelta(hours=hours)
+                if fire > now_msk:
+                    fire_str = fire.strftime("%Y-%m-%d %H:%M")
+                    c.execute(
+                        "INSERT OR IGNORE INTO reminders(apt_id,user_id,fire_time,type,label) "
+                        "VALUES(?,?,?,'reminder',?)",
+                        (apt_id, uid, fire_str, label)
+                    )
+            review_fire = apt_dt + timedelta(hours=24)
+            if review_fire > now_msk:
+                fire_str = review_fire.strftime("%Y-%m-%d %H:%M")
+                c.execute(
+                    "INSERT OR IGNORE INTO reminders(apt_id,user_id,fire_time,type,label) "
+                    "VALUES(?,?,?,'review','')",
+                    (apt_id, uid, fire_str)
                 )
-        review_fire = apt_dt + timedelta(hours=24)
-        if review_fire > now_msk:
-            app.job_queue.run_once(
-                _ask_review, when=review_fire,
-                data={"apt_id": apt_id, "uid": uid},
-                name=f"review_{apt_id}",
-            )
+        log.info("Напоминания запланированы для записи %s", apt_id)
     except Exception as e:
-        log.warning("Ошибка планирования: %s", e)
+        log.warning("Ошибка планирования напоминания: %s", e)
 
 def cancel_reminders(app, apt_id):
-    if not app.job_queue:
-        return
-    for h in (24, 2):
-        for j in app.job_queue.get_jobs_by_name(f"rem_{apt_id}_{h}"):
-            j.schedule_removal()
-    for j in app.job_queue.get_jobs_by_name(f"review_{apt_id}"):
-        j.schedule_removal()
+    """Отменяет напоминания — помечает как отправленные в БД."""
+    with _lock, _db() as c:
+        c.execute("UPDATE reminders SET sent=1 WHERE apt_id=?", (apt_id,))
 
-async def _remind(ctx: ContextTypes.DEFAULT_TYPE):
-    d   = ctx.job.data
-    apt = get_apt(d["apt_id"])
-    if not apt or apt["status"] not in ("confirmed", "pending"):
-        return
-    try:
-        await ctx.bot.send_message(
-            d["uid"],
-            f"🔔 *Напоминание о визите!*\n\n"
-            f"Вы записаны *{d['label']}*:\n"
-            f"📅 {fmt_date(apt['date'])} в {apt['time']}\n"
-            f"💆 {apt['procedure']}\n\n"
-            f"Вопросы: {MASTER_PHONE}",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        log.warning("Ошибка напоминания: %s", e)
+async def _process_reminders(ctx: ContextTypes.DEFAULT_TYPE):
+    """Запускается каждую минуту. Отправляет напоминания из БД."""
+    now_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    with _lock, _db() as c:
+        rows = c.execute(
+            "SELECT * FROM reminders WHERE sent=0 AND fire_time<=?", (now_str,)
+        ).fetchall()
+    
+    for row in rows:
+        r = dict(row)
+        try:
+            apt = get_apt(r["apt_id"])
+            if not apt or apt["status"] not in ("confirmed", "pending"):
+                # Запись отменена — просто помечаем как отправленное
+                with _lock, _db() as c:
+                    c.execute("UPDATE reminders SET sent=1 WHERE id=?", (r["id"],))
+                continue
 
-async def _ask_review(ctx: ContextTypes.DEFAULT_TYPE):
-    d   = ctx.job.data
-    apt = get_apt(d["apt_id"])
-    if not apt or apt["status"] != "confirmed":
-        return
-    try:
-        await ctx.bot.send_message(
-            d["uid"],
-            f"🌸 Как прошёл визит?\n\n"
-            f"💆 {apt['procedure']} · {fmt_date(apt['date'])}\n\n"
-            "Поставьте оценку:",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⭐ 1", callback_data=f"rev_{apt['id']}_1"),
-                InlineKeyboardButton("⭐ 2", callback_data=f"rev_{apt['id']}_2"),
-                InlineKeyboardButton("⭐ 3", callback_data=f"rev_{apt['id']}_3"),
-                InlineKeyboardButton("⭐ 4", callback_data=f"rev_{apt['id']}_4"),
-                InlineKeyboardButton("⭐ 5", callback_data=f"rev_{apt['id']}_5"),
-            ]]),
-        )
-    except Exception as e:
-        log.warning("Ошибка запроса отзыва: %s", e)
+            if r["type"] == "reminder":
+                await ctx.bot.send_message(
+                    r["user_id"],
+                    f"🔔 *Напоминание о визите!*\n\n"
+                    f"Вы записаны *{r['label']}*:\n"
+                    f"📅 {fmt_date(apt['date'])} в {apt['time']}\n"
+                    f"💆 {apt['procedure']}\n\n"
+                    f"Вопросы: {MASTER_PHONE}",
+                    parse_mode="Markdown",
+                )
+            elif r["type"] == "review":
+                if apt["status"] == "confirmed":
+                    await ctx.bot.send_message(
+                        r["user_id"],
+                        f"🌸 Как прошёл визит?\n\n"
+                        f"💆 {apt['procedure']} · {fmt_date(apt['date'])}\n\n"
+                        "Поставьте оценку:",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⭐ 1", callback_data=f"rev_{apt['id']}_1"),
+                            InlineKeyboardButton("⭐ 2", callback_data=f"rev_{apt['id']}_2"),
+                            InlineKeyboardButton("⭐ 3", callback_data=f"rev_{apt['id']}_3"),
+                            InlineKeyboardButton("⭐ 4", callback_data=f"rev_{apt['id']}_4"),
+                            InlineKeyboardButton("⭐ 5", callback_data=f"rev_{apt['id']}_5"),
+                        ]]),
+                    )
+
+            # Помечаем как отправленное
+            with _lock, _db() as c:
+                c.execute("UPDATE reminders SET sent=1 WHERE id=?", (r["id"],))
+            log.info("Напоминание отправлено: %s type=%s", r["apt_id"], r["type"])
+
+        except Exception as e:
+            log.warning("Ошибка отправки напоминания id=%s: %s", r["id"], e)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # КЛАВИАТУРЫ
@@ -1360,10 +1380,12 @@ def main():
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
+    # Напоминания из БД — работает даже после перезапуска
     if app.job_queue:
-        log.info("Напоминания активны ✅")
+        app.job_queue.run_repeating(_process_reminders, interval=60, first=10)
+        log.info("Планировщик напоминаний из БД запущен ✅")
     else:
-        log.warning('pip install "python-telegram-bot[job-queue]"')
+        log.warning('JobQueue недоступен. pip install "python-telegram-bot[job-queue]"')
 
     log.info("Бот запущен ✅")
     app.run_polling(drop_pending_updates=True)
