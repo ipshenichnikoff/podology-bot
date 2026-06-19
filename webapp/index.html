@@ -177,8 +177,7 @@ var params  = new URLSearchParams(location.search);
 var DATA_URL = params.get("data_url") || "";
 
 function loadData() {
-  if (!DATA_URL || DATA_URL === "BOT_DATA_URL_PLACEHOLDER") {
-    // Данные переданы через hash (fallback)
+  if (!DATA_URL) {
     try {
       var raw = location.hash.slice(1) || new URLSearchParams(location.search).get('data') || '';
       if (raw) {
@@ -191,23 +190,47 @@ function loadData() {
     return;
   }
 
+  // Пробуем fetch (более совместим с Telegram WebView)
+  if (window.fetch) {
+    fetch(DATA_URL, { method: "GET", cache: "no-store" })
+      .then(function(res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function(json) {
+        appData = json;
+        onDataLoaded();
+      })
+      .catch(function(err) {
+        console.error("fetch error:", err);
+        loadDataXHR(); // fallback на XHR
+      });
+  } else {
+    loadDataXHR();
+  }
+}
+
+function loadDataXHR() {
   var xhr = new XMLHttpRequest();
   xhr.open("GET", DATA_URL, true);
-  xhr.timeout = 5000;
+  xhr.timeout = 8000;
   xhr.onload = function() {
     if (xhr.status === 200) {
       try {
         appData = JSON.parse(xhr.responseText);
         onDataLoaded();
       } catch(e) {
-        showError("Ошибка данных. Попробуйте ещё раз.");
+        showError("Ошибка обработки данных (status " + xhr.status + ").");
       }
     } else {
-      showError("Сервер недоступен. Попробуйте позже.");
+      showError("Сервер вернул ошибку " + xhr.status + ".");
     }
   };
-  xhr.onerror = xhr.ontimeout = function() {
-    showError("Нет соединения. Проверьте интернет.");
+  xhr.onerror = function() {
+    showError("Не удалось подключиться к серверу.<br><small>" + DATA_URL + "</small>");
+  };
+  xhr.ontimeout = function() {
+    showError("Сервер не отвечает (таймаут).");
   };
   xhr.send();
 }
