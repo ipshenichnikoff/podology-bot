@@ -35,7 +35,7 @@ ADMIN_ID      = int(os.getenv("ADMIN_ID", "223326752"))
 
 # URL Mini App на GitHub Pages (оставьте пустым если не используете)
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ipshenichnikoff.github.io/podology-bot/webapp/index.html")
-BOT_HOST   = os.getenv("BOT_HOST",   "https://bot-1781815502-7942-igorpshenichnikov.bothost.tech")
+BOT_HOST   = os.getenv("BOT_HOST",   "https://bot-1781876805-1609-igorpshenichnikov.bothost.tech")
 
 MASTER_NAME   = "Екатерина Шлейфер"
 MASTER_PHONE  = "8 (920) 649 26-16"
@@ -1395,11 +1395,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_web_app_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import json
+    log.info("WEB_APP_DATA получено от uid=%s: %s", update.effective_user.id,
+              update.message.web_app_data.data if update.message.web_app_data else "NONE")
     try:
         data = json.loads(update.message.web_app_data.data)
-    except Exception:
+    except Exception as e:
+        log.warning("Ошибка парсинга web_app_data: %s", e)
         return
     if data.get("action") != "book":
+        log.info("action != book, пропускаем: %s", data.get("action"))
         return
     uid       = update.effective_user.id
     proc_idx  = data.get("proc_idx", 0)
