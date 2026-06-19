@@ -42,15 +42,12 @@
   .proc-card {
     background: var(--card); border-radius: var(--radius);
     padding: 14px 16px; margin-bottom: 10px;
-    border: 2px solid transparent; cursor: pointer;
-    transition: all .2s; display: flex; align-items: center; gap: 12px;
+    border: 2px solid transparent; cursor: pointer; display: flex; align-items: center; gap: 12px;
   }
   .proc-card.selected { border-color: var(--primary); background: var(--primary-light); }
   .proc-icon {
-    width: 44px; height: 44px; border-radius: 12px;
-    background: var(--primary-light);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 22px; flex-shrink: 0;
+    width: 44px; height: 44px; border-radius: 12px; background: var(--primary-light);
+    display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0;
   }
   .proc-info { flex: 1; }
   .proc-name { font-size: 15px; font-weight: 600; }
@@ -70,48 +67,30 @@
   .times-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .time-btn {
     background: var(--card); border: 2px solid transparent;
-    border-radius: 12px; padding: 12px 8px;
-    text-align: center; font-size: 16px; font-weight: 600; cursor: pointer;
+    border-radius: 12px; padding: 12px 8px; text-align: center;
+    font-size: 16px; font-weight: 600; cursor: pointer;
   }
   .time-btn.selected { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
   .summary-card { background: var(--card); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
-  .summary-row {
-    display: flex; align-items: flex-start; gap: 12px;
-    padding: 10px 0; border-bottom: 1px solid var(--border);
-  }
+  .summary-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
   .summary-row:last-child { border-bottom: none; }
   .summary-icon { font-size: 20px; width: 28px; text-align: center; flex-shrink: 0; }
   .summary-label { font-size: 12px; color: var(--text-muted); }
   .summary-value { font-size: 15px; font-weight: 600; margin-top: 2px; }
-  .master-card {
-    background: var(--card); border-radius: var(--radius);
-    padding: 16px; display: flex; align-items: center; gap: 12px;
-  }
-  .master-avatar {
-    width: 52px; height: 52px; border-radius: 50%;
-    background: linear-gradient(135deg, #e91e8c, #c2185b);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 24px; flex-shrink: 0;
-  }
+  .master-card { background: var(--card); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 12px; }
+  .master-avatar { width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, #e91e8c, #c2185b); display: flex; align-items: center; justify-content: center; font-size: 24px; flex-shrink: 0; }
   .master-name { font-size: 15px; font-weight: 700; }
   .master-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-  .btn-next {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    background: var(--primary); color: white; border: none;
-    padding: 16px; font-size: 16px; font-weight: 700;
-    cursor: pointer; display: none;
-  }
+  .btn-next { position: fixed; bottom: 0; left: 0; right: 0; background: var(--primary); color: white; border: none; padding: 16px; font-size: 16px; font-weight: 700; cursor: pointer; display: none; }
   .btn-next.visible { display: block; }
   .success-screen { text-align: center; padding: 40px 20px; }
   .success-icon { font-size: 64px; margin-bottom: 16px; }
   .success-screen h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
   .success-screen p  { color: var(--text-muted); font-size: 14px; line-height: 1.5; }
+  .loading { text-align: center; padding: 60px 20px; color: var(--text-muted); font-size: 15px; }
+  .loading .spinner { font-size: 40px; margin-bottom: 16px; animation: spin 1s linear infinite; display: block; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   .empty { text-align: center; color: var(--text-muted); padding: 32px 0; font-size: 14px; }
-  .error-banner {
-    background: #fff3cd; border: 1px solid #ffc107;
-    border-radius: 12px; padding: 12px 16px; margin: 16px;
-    font-size: 13px; color: #856404; display: none;
-  }
 </style>
 </head>
 <body>
@@ -131,11 +110,15 @@
   <div class="step" id="step4">✓</div>
 </div>
 
-<div class="error-banner" id="errorBanner"></div>
-
 <div class="screen active" id="screen1">
-  <div class="section-title">Выберите процедуру</div>
-  <div id="procList"></div>
+  <div id="loadingBlock" class="loading">
+    <span class="spinner">⏳</span>
+    Загружаем данные...
+  </div>
+  <div id="procContent" style="display:none">
+    <div class="section-title">Выберите процедуру</div>
+    <div id="procList"></div>
+  </div>
 </div>
 
 <div class="screen" id="screen2">
@@ -168,95 +151,106 @@
 <button class="btn-next" id="btnNext">Далее →</button>
 
 <script>
-// ── Безопасная инициализация Telegram WebApp ────────────────────────────────
 var tg = null;
 var tgUser = { first_name: 'Клиент', id: 0 };
 
-function initTelegram() {
-  try {
-    if (window.Telegram && window.Telegram.WebApp) {
-      tg = window.Telegram.WebApp;
-      tg.expand();
-      tg.ready();
-      if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-        tgUser = tg.initDataUnsafe.user;
-      }
-      return true;
-    }
-  } catch(e) {
-    console.warn('Telegram WebApp init error:', e);
-  }
-  return false;
-}
-
-// Пробуем инициализировать сразу
-var tgReady = initTelegram();
-
-// Если не получилось — ждём загрузки скрипта
-if (!tgReady) {
-  var script = document.createElement('script');
-  script.src = 'https://telegram.org/js/telegram-web-app.js';
-  script.onload = function() { tgReady = initTelegram(); };
-  script.onerror = function() {
-    console.warn('Telegram script failed to load — running in standalone mode');
-  };
-  document.head.appendChild(script);
-}
-
-// ── Данные ──────────────────────────────────────────────────────────────────
-var appData = {};
+// Инициализация Telegram WebApp
 try {
-  var raw = location.hash.slice(1) || new URLSearchParams(location.search).get('data') || '';
-  if (raw) appData = JSON.parse(decodeURIComponent(raw));
-} catch(e) {
-  console.warn('Failed to parse appData:', e);
-}
+  if (window.Telegram && window.Telegram.WebApp) {
+    tg = window.Telegram.WebApp;
+    tg.expand();
+    tg.ready();
+    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      tgUser = tg.initDataUnsafe.user;
+    }
+  }
+} catch(e) {}
 
-var procedures  = appData.procedures  || [];
-var masterName  = appData.master_name  || 'Екатерина Шлейфер';
-var masterPhone = appData.master_phone || '8 (920) 649 26-16';
-var masterRating= appData.rating       || '4.9';
-
-document.getElementById('masterInfo').textContent  = masterName + ' · ⭐ ' + masterRating;
-document.getElementById('masterName2').textContent  = masterName;
-document.getElementById('masterPhone2').textContent = masterPhone;
-
-// ── Состояние ───────────────────────────────────────────────────────────────
-var state = { step: 1, proc: null, date: null, time: null };
-
+var appData = { procedures: [], dates: [] };
+var state   = { step: 1, proc: null, date: null, time: null };
 var ICONS    = ['🦶','🩺','💉','💅','🔧','⚙️','🛡️','🩹','🔬'];
 var MONTHS_S = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 var DAYS_S   = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
 
-// ── Рендер процедур ─────────────────────────────────────────────────────────
+// Получаем DATA_URL из параметра или из переменной подставленной ботом
+var params  = new URLSearchParams(location.search);
+var DATA_URL = params.get("data_url") || "";
+
+function loadData() {
+  if (!DATA_URL || DATA_URL === "BOT_DATA_URL_PLACEHOLDER") {
+    // Данные переданы через hash (fallback)
+    try {
+      var raw = location.hash.slice(1) || new URLSearchParams(location.search).get('data') || '';
+      if (raw) {
+        appData = JSON.parse(decodeURIComponent(raw));
+        onDataLoaded();
+        return;
+      }
+    } catch(e) {}
+    showError("Не удалось загрузить данные. Закройте и откройте заново.");
+    return;
+  }
+
+  var xhr = new XMLHttpRequest();
+  xhr.open("GET", DATA_URL, true);
+  xhr.timeout = 5000;
+  xhr.onload = function() {
+    if (xhr.status === 200) {
+      try {
+        appData = JSON.parse(xhr.responseText);
+        onDataLoaded();
+      } catch(e) {
+        showError("Ошибка данных. Попробуйте ещё раз.");
+      }
+    } else {
+      showError("Сервер недоступен. Попробуйте позже.");
+    }
+  };
+  xhr.onerror = xhr.ontimeout = function() {
+    showError("Нет соединения. Проверьте интернет.");
+  };
+  xhr.send();
+}
+
+function onDataLoaded() {
+  document.getElementById('masterInfo').textContent =
+    (appData.master_name || '') + ' · ⭐ ' + (appData.rating || '4.9');
+  document.getElementById('masterName2').textContent  = appData.master_name  || '';
+  document.getElementById('masterPhone2').textContent = appData.master_phone || '';
+
+  renderProcs();
+  document.getElementById('loadingBlock').style.display = 'none';
+  document.getElementById('procContent').style.display  = 'block';
+}
+
+function showError(msg) {
+  document.getElementById('loadingBlock').innerHTML =
+    '<div style="font-size:40px;margin-bottom:16px">😔</div><div>' + msg + '</div>';
+}
+
 function renderProcs() {
   var list = document.getElementById('procList');
-  if (!procedures.length) {
+  var procs = appData.procedures || [];
+  if (!procs.length) {
     list.innerHTML = '<div class="empty">Нет доступных услуг</div>';
     return;
   }
-  list.innerHTML = procedures.map(function(p, i) {
+  list.innerHTML = procs.map(function(p, i) {
     return '<div class="proc-card" id="proc' + i + '" onclick="selectProc(' + i + ')">' +
-      '<div class="proc-icon">' + ICONS[i % ICONS.length] + '</div>' +
-      '<div class="proc-info">' +
-        '<div class="proc-name">' + p.name + '</div>' +
-        '<div class="proc-meta">⏱ ' + p.dur + ' мин</div>' +
-      '</div>' +
-      '<div class="proc-price">' + p.price + '</div>' +
-    '</div>';
+      '<div class="proc-icon">' + (ICONS[i % ICONS.length]) + '</div>' +
+      '<div class="proc-info"><div class="proc-name">' + p.name + '</div>' +
+      '<div class="proc-meta">⏱ ' + p.dur + ' мин</div></div>' +
+      '<div class="proc-price">' + p.price + '</div></div>';
   }).join('');
 }
 
 function selectProc(i) {
   state.proc = i;
   var cards = document.querySelectorAll('.proc-card');
-  for (var j = 0; j < cards.length; j++) {
-    cards[j].classList.toggle('selected', i === j);
-  }
+  for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
   showBtn('Выбрать дату →');
 }
 
-// ── Рендер дат ──────────────────────────────────────────────────────────────
 function renderDates() {
   var dates = appData.dates || [];
   var grid  = document.getElementById('dateGrid');
@@ -266,34 +260,26 @@ function renderDates() {
   }
   grid.innerHTML = dates.map(function(d) {
     var dt  = new Date(d.date + 'T00:00:00');
-    var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total / 2) ? 'yellow' : 'red');
+    var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total/2) ? 'yellow' : 'red');
     return '<div class="date-btn" id="date_' + d.date + '" onclick="selectDate(\'' + d.date + '\')">' +
       '<div class="day-name">' + DAYS_S[dt.getDay()] + '</div>' +
       '<div class="day-num">' + dt.getDate() + '</div>' +
       '<div class="day-mon">' + MONTHS_S[dt.getMonth()] + '</div>' +
-      '<div class="dot ' + dot + '"></div>' +
-    '</div>';
+      '<div class="dot ' + dot + '"></div></div>';
   }).join('');
 }
 
 function selectDate(date) {
-  state.date = date;
-  state.time = null;
+  state.date = date; state.time = null;
   var btns = document.querySelectorAll('.date-btn');
-  for (var i = 0; i < btns.length; i++) {
+  for (var i = 0; i < btns.length; i++)
     btns[i].classList.toggle('selected', btns[i].id === 'date_' + date);
-  }
-
-  var d     = null;
-  var dates = appData.dates || [];
-  for (var j = 0; j < dates.length; j++) {
-    if (dates[j].date === date) { d = dates[j]; break; }
-  }
+  var d = null, dates = appData.dates || [];
+  for (var j = 0; j < dates.length; j++) if (dates[j].date === date) { d = dates[j]; break; }
   var slots = d ? d.slots : [];
-
   document.getElementById('timesTitle').style.display = slots.length ? 'block' : 'none';
   document.getElementById('timesGrid').innerHTML = slots.map(function(t) {
-    return '<div class="time-btn" id="time_' + t.replace(':', '_') + '" onclick="selectTime(\'' + t + '\')">' + t + '</div>';
+    return '<div class="time-btn" id="time_' + t.replace(':','_') + '" onclick="selectTime(\'' + t + '\')">' + t + '</div>';
   }).join('');
   hideBtn();
 }
@@ -301,58 +287,44 @@ function selectDate(date) {
 function selectTime(t) {
   state.time = t;
   var btns = document.querySelectorAll('.time-btn');
-  for (var i = 0; i < btns.length; i++) {
-    btns[i].classList.toggle('selected', btns[i].id === 'time_' + t.replace(':', '_'));
-  }
+  for (var i = 0; i < btns.length; i++)
+    btns[i].classList.toggle('selected', btns[i].id === 'time_' + t.replace(':','_'));
   showBtn('Продолжить →');
 }
 
-// ── Итоговая карточка ───────────────────────────────────────────────────────
 function renderSummary() {
-  var p    = procedures[state.proc] || {};
-  var dt   = new Date(state.date + 'T00:00:00');
+  var p = (appData.procedures || [])[state.proc] || {};
+  var dt = new Date(state.date + 'T00:00:00');
   var dateStr = DAYS_S[dt.getDay()] + ', ' + dt.getDate() + ' ' + MONTHS_S[dt.getMonth()];
-  var userName = tgUser.first_name || 'Клиент';
-
   document.getElementById('summaryCard').innerHTML =
-    '<div class="summary-row"><div class="summary-icon">💆</div>' +
-    '<div><div class="summary-label">Процедура</div><div class="summary-value">' + (p.name || '—') + '</div></div></div>' +
-
-    '<div class="summary-row"><div class="summary-icon">📅</div>' +
-    '<div><div class="summary-label">Дата и время</div><div class="summary-value">' + dateStr + ' в ' + state.time + '</div></div></div>' +
-
-    '<div class="summary-row"><div class="summary-icon">⏱</div>' +
-    '<div><div class="summary-label">Длительность</div><div class="summary-value">' + p.dur + ' мин</div></div></div>' +
-
-    '<div class="summary-row"><div class="summary-icon">💰</div>' +
-    '<div><div class="summary-label">Стоимость</div><div class="summary-value">' + p.price + '</div></div></div>' +
-
-    '<div class="summary-row"><div class="summary-icon">👤</div>' +
-    '<div><div class="summary-label">Клиент</div><div class="summary-value">' + userName + '</div></div></div>';
+    row('💆','Процедура', p.name || '—') +
+    row('📅','Дата и время', dateStr + ' в ' + state.time) +
+    row('⏱','Длительность', p.dur + ' мин') +
+    row('💰','Стоимость', p.price) +
+    row('👤','Клиент', tgUser.first_name || 'Клиент');
 }
 
-// ── Навигация ───────────────────────────────────────────────────────────────
+function row(icon, label, value) {
+  return '<div class="summary-row"><div class="summary-icon">' + icon + '</div>' +
+    '<div><div class="summary-label">' + label + '</div>' +
+    '<div class="summary-value">' + value + '</div></div></div>';
+}
+
 function showBtn(text) {
   var btn = document.getElementById('btnNext');
-  btn.textContent = text;
-  btn.classList.add('visible');
+  btn.textContent = text; btn.classList.add('visible');
 }
-function hideBtn() {
-  document.getElementById('btnNext').classList.remove('visible');
-}
+function hideBtn() { document.getElementById('btnNext').classList.remove('visible'); }
 
 function goToStep(n) {
   var screens = document.querySelectorAll('.screen');
-  for (var i = 0; i < screens.length; i++) {
-    screens[i].classList.toggle('active', i + 1 === n);
-  }
+  for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('active', i+1 === n);
   for (var j = 1; j <= 4; j++) {
     var el = document.getElementById('step' + j);
     el.className = 'step' + (j < n ? ' done' : j === n ? ' active' : '');
     el.textContent = j < n ? '✓' : j;
   }
-  state.step = n;
-  hideBtn();
+  state.step = n; hideBtn();
   if (n === 2) renderDates();
   if (n === 3) { renderSummary(); showBtn('Отправить заявку ✓'); }
 }
@@ -364,34 +336,19 @@ document.getElementById('btnNext').onclick = function() {
 };
 
 function submitBooking() {
-  var p = procedures[state.proc] || {};
+  var p = (appData.procedures || [])[state.proc] || {};
   var payload = JSON.stringify({
-    action:         'book',
-    proc_idx:       state.proc,
-    proc_name:      p.name,
-    proc_dur:       p.dur,
-    proc_price_raw: p.price_raw,
-    date:           state.date,
-    time:           state.time,
+    action: 'book', proc_idx: state.proc,
+    proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
+    date: state.date, time: state.time,
   });
-
   if (tg && tg.sendData) {
-    try {
-      tg.sendData(payload);
-      return;
-    } catch(e) {
-      console.warn('tg.sendData failed:', e);
-    }
+    try { tg.sendData(payload); return; } catch(e) {}
   }
-  // Fallback — показываем экран успеха и просим написать боту
   goToStep(4);
-  document.querySelector('.success-screen p').innerHTML =
-    'Откройте бот и запишитесь через кнопку «📅 Записаться» в меню.<br>' +
-    'Или перешлите мастеру: <b>' + p.name + ', ' + state.date + ' в ' + state.time + '</b>';
 }
 
-// ── Старт ───────────────────────────────────────────────────────────────────
-renderProcs();
+loadData();
 </script>
 </body>
 </html>
