@@ -153,7 +153,7 @@
   </div>
 </div>
 
-<button class="btn-next" id="btnNext">Далее →</button>
+<!-- старая фиксированная кнопка удалена — теперь используются inline-кнопки и автопереходы -->
 
 <script>
 var tg = null;
@@ -360,19 +360,12 @@ function showBtn(text) {
       tg.MainButton.show();
     } catch(e) {
       console.log('MainButton error:', e.message);
-      var btn = document.getElementById('btnNext');
-      btn.textContent = text; btn.classList.add('visible');
     }
-  } else {
-    var btn = document.getElementById('btnNext');
-    btn.textContent = text; btn.classList.add('visible');
   }
 }
 function hideBtn() {
   if (tg && tg.MainButton) {
-    tg.MainButton.hide();
-  } else {
-    document.getElementById('btnNext').classList.remove('visible');
+    try { tg.MainButton.hide(); } catch(e) {}
   }
 }
 
@@ -399,7 +392,6 @@ function handleNextClick() {
   }
 }
 
-document.getElementById('btnNext').onclick = handleNextClick;
 if (tg && tg.MainButton) {
   tg.MainButton.onClick(function() {
     console.log('MainButton clicked!');
@@ -408,7 +400,6 @@ if (tg && tg.MainButton) {
 }
 
 function submitBooking() {
-  alert('Кнопка нажата! step=' + state.step + ' proc=' + state.proc);
   var p = (appData.procedures || [])[state.proc] || {};
   var payload = JSON.stringify({
     action: 'book', proc_idx: state.proc,
