@@ -99,6 +99,7 @@
 <div class="header">
   <h1>💆 Запись к подологу</h1>
   <p id="masterInfo">Загрузка...</p>
+  <p id="debugLine" style="font-size:10px;opacity:0.6;margin-top:6px;word-break:break-all"></p>
 </div>
 
 <div class="steps">
@@ -156,16 +157,29 @@ var tg = null;
 var tgUser = { first_name: 'Клиент', id: 0 };
 
 // Инициализация Telegram WebApp
+var debugInfo = [];
 try {
+  debugInfo.push('window.Telegram exists: ' + !!window.Telegram);
+  if (window.Telegram) {
+    debugInfo.push('window.Telegram.WebApp exists: ' + !!window.Telegram.WebApp);
+  }
   if (window.Telegram && window.Telegram.WebApp) {
     tg = window.Telegram.WebApp;
     tg.expand();
     tg.ready();
+    debugInfo.push('tg.initData length: ' + (tg.initData || '').length);
     if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
       tgUser = tg.initDataUnsafe.user;
+      debugInfo.push('user found: ' + tgUser.first_name);
+    } else {
+      debugInfo.push('no user in initDataUnsafe');
     }
   }
-} catch(e) {}
+} catch(e) {
+  debugInfo.push('ERROR: ' + e.message);
+}
+console.log('Telegram WebApp debug:', debugInfo.join(' | '));
+try { document.getElementById('debugLine').textContent = debugInfo.join(' | '); } catch(e) {}
 
 var appData = { procedures: [], dates: [] };
 var state   = { step: 1, proc: null, date: null, time: null };
