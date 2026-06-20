@@ -379,9 +379,13 @@ function goToStep(n) {
 }
 
 function handleNextClick() {
+  console.log('CLICK: step=' + state.step + ' proc=' + state.proc + ' date=' + state.date + ' time=' + state.time);
   if (state.step === 1 && state.proc !== null) goToStep(2);
   else if (state.step === 2 && state.date && state.time) goToStep(3);
   else if (state.step === 3) submitBooking();
+  else {
+    alert('Клик не обработан. step=' + state.step + ' proc=' + state.proc + ' date=' + state.date + ' time=' + state.time);
+  }
 }
 
 document.getElementById('btnNext').onclick = handleNextClick;
