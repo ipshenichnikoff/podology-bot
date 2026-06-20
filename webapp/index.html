@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Запись к подологу</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+  window.onerror = function(msg, url, line, col, error) {
+    document.body.innerHTML = '<div style="padding:20px;font-family:monospace;font-size:13px;color:#c00;background:#fff">' +
+      '<b>JS Error:</b><br>' + msg + '<br>Line: ' + line + ':' + col +
+      (error && error.stack ? '<br><br>Stack:<br>' + error.stack.replace(/\\n/g, '<br>') : '') +
+      '</div>';
+    return true;
+  };
+</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   :root {
