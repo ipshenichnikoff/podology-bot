@@ -319,7 +319,7 @@ function selectDate(date) {
   document.getElementById('timesGrid').innerHTML = slots.map(function(t) {
     return '<div class="time-btn" id="time_' + t.replace(':','_') + '" onclick="selectTime(\'' + t + '\')">' + t + '</div>';
   }).join('');
-  hideBtn();
+  // Не скрываем кнопку здесь — просто оставляем как есть до выбора времени
 }
 
 function selectTime(t) {
@@ -350,8 +350,15 @@ function row(icon, label, value) {
 
 function showBtn(text) {
   if (tg && tg.MainButton) {
-    tg.MainButton.setText(text);
-    tg.MainButton.show();
+    try {
+      tg.MainButton.setText(text);
+      tg.MainButton.enable();
+      tg.MainButton.show();
+    } catch(e) {
+      console.log('MainButton error:', e.message);
+      var btn = document.getElementById('btnNext');
+      btn.textContent = text; btn.classList.add('visible');
+    }
   } else {
     var btn = document.getElementById('btnNext');
     btn.textContent = text; btn.classList.add('visible');
@@ -390,7 +397,10 @@ function handleNextClick() {
 
 document.getElementById('btnNext').onclick = handleNextClick;
 if (tg && tg.MainButton) {
-  tg.MainButton.onClick(handleNextClick);
+  tg.MainButton.onClick(function() {
+    console.log('MainButton clicked!');
+    handleNextClick();
+  });
 }
 
 function submitBooking() {
