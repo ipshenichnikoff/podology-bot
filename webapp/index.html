@@ -365,10 +365,20 @@ function submitBooking() {
     proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
     date: state.date, time: state.time,
   });
-  if (tg && tg.sendData) {
-    try { tg.sendData(payload); return; } catch(e) {}
+
+  if (!tg) {
+    alert('Telegram WebApp недоступен. Откройте приложение через кнопку в боте.');
+    return;
   }
-  goToStep(4);
+  if (!tg.sendData) {
+    alert('tg.sendData недоступен в этой версии Telegram.');
+    return;
+  }
+  try {
+    tg.sendData(payload);
+  } catch(e) {
+    alert('Ошибка отправки: ' + e.message);
+  }
 }
 
 loadData();
