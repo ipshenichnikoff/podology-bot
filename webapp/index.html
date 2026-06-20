@@ -360,12 +360,20 @@
       proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
       date: state.date, time: state.time,
     });
+
+    // Временная диагностика — показываем что именно отправляем
+    alert('Отправляю:\n' + payload + '\n\ntg доступен: ' + !!tg + '\nsendData доступен: ' + !!(tg && tg.sendData));
+
     if (tg && tg.sendData) {
       hideMainButton();
-      tg.sendData(payload);
-      // Telegram закроет Mini App автоматически сразу после sendData —
-      // это нормальное поведение платформы, экран "Заявка отправлена"
-      // увидеть здесь не успеем. Подтверждение придёт сообщением в чат бота.
+      try {
+        tg.sendData(payload);
+        alert('sendData вызван без ошибок');
+      } catch(e) {
+        alert('ОШИБКА sendData: ' + e.message);
+      }
+    } else {
+      alert('tg или tg.sendData недоступны!');
     }
   }
 
