@@ -5,15 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Запись к подологу</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script>
-  window.onerror = function(msg, url, line, col, error) {
-    document.body.innerHTML = '<div style="padding:20px;font-family:monospace;font-size:13px;color:#c00;background:#fff">' +
-      '<b>JS Error:</b><br>' + msg + '<br>Line: ' + line + ':' + col +
-      (error && error.stack ? '<br><br>Stack:<br>' + error.stack.replace(/\\n/g, '<br>') : '') +
-      '</div>';
-    return true;
-  };
-</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   :root {
@@ -25,7 +16,7 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg); color: var(--text);
-    min-height: 100vh; padding-bottom: 80px;
+    min-height: 100vh; padding-bottom: 30px;
   }
   .header {
     background: linear-gradient(135deg, #e91e8c, #c2185b);
@@ -87,12 +78,10 @@
   .summary-icon { font-size: 20px; width: 28px; text-align: center; flex-shrink: 0; }
   .summary-label { font-size: 12px; color: var(--text-muted); }
   .summary-value { font-size: 15px; font-weight: 600; margin-top: 2px; }
-  .master-card { background: var(--card); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 12px; }
+  .master-card { background: var(--card); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
   .master-avatar { width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, #e91e8c, #c2185b); display: flex; align-items: center; justify-content: center; font-size: 24px; flex-shrink: 0; }
   .master-name { font-size: 15px; font-weight: 700; }
   .master-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-  .btn-next { position: fixed; bottom: 0; left: 0; right: 0; background: var(--primary); color: white; border: none; padding: 16px; font-size: 16px; font-weight: 700; cursor: pointer; display: none; }
-  .btn-next.visible { display: block; }
   .success-screen { text-align: center; padding: 40px 20px; }
   .success-icon { font-size: 64px; margin-bottom: 16px; }
   .success-screen h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
@@ -148,9 +137,6 @@
       <div class="master-meta" id="masterPhone2">—</div>
     </div>
   </div>
-  <button onclick="submitBooking()" style="width:100%;margin-top:16px;background:var(--primary);color:white;border:none;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer">
-    Отправить заявку ✓
-  </button>
 </div>
 
 <div class="screen" id="screen4">
@@ -161,47 +147,32 @@
   </div>
 </div>
 
-<!-- старая фиксированная кнопка удалена — теперь используются inline-кнопки и автопереходы -->
-
 <script>
-var tg = null;
-var tgUser = { first_name: 'Клиент', id: 0 };
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  var tgUser = { first_name: 'Клиент', id: 0 };
 
-if (window.Telegram && window.Telegram.WebApp) {
-  tg = window.Telegram.WebApp;
-  tg.expand();
-  tg.ready();
-  if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-    tgUser = tg.initDataUnsafe.user;
-  }
-}
-
-var appData = { procedures: [], dates: [] };
-var state   = { step: 1, proc: null, date: null, time: null };
-var ICONS    = ['🦶','🩺','💉','💅','🔧','⚙️','🛡️','🩹','🔬'];
-var MONTHS_S = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-var DAYS_S   = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
-
-// Получаем DATA_URL из параметра или из переменной подставленной ботом
-var params  = new URLSearchParams(location.search);
-var DATA_URL = params.get("data_url") || "";
-
-function loadData() {
-  if (!DATA_URL) {
-    try {
-      var raw = location.hash.slice(1) || new URLSearchParams(location.search).get('data') || '';
-      if (raw) {
-        appData = JSON.parse(decodeURIComponent(raw));
-        onDataLoaded();
-        return;
-      }
-    } catch(e) {}
-    showError("Не удалось загрузить данные. Закройте и откройте заново.");
-    return;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      tgUser = tg.initDataUnsafe.user;
+    }
   }
 
-  // Пробуем fetch (более совместим с Telegram WebView)
-  if (window.fetch) {
+  var appData = { procedures: [], dates: [] };
+  var state   = { step: 1, proc: null, date: null, time: null };
+  var ICONS    = ['🦶','🩺','💉','💅','🔧','⚙️','🛡️','🩹','🔬'];
+  var MONTHS_S = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+  var DAYS_S   = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+
+  var params   = new URLSearchParams(location.search);
+  var DATA_URL = params.get("data_url") || "";
+
+  function loadData() {
+    if (!DATA_URL) {
+      showError("Не удалось загрузить данные. Закройте и откройте заново.");
+      return;
+    }
     fetch(DATA_URL, { method: "GET", cache: "no-store" })
       .then(function(res) {
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -212,197 +183,189 @@ function loadData() {
         onDataLoaded();
       })
       .catch(function(err) {
-        console.error("fetch error:", err);
-        loadDataXHR(); // fallback на XHR
+        showError("Ошибка загрузки: " + err.message);
       });
-  } else {
-    loadDataXHR();
   }
-}
 
-function loadDataXHR() {
-  var xhr = new XMLHttpRequest();
-  xhr.open("GET", DATA_URL, true);
-  xhr.timeout = 8000;
-  xhr.onload = function() {
-    if (xhr.status === 200) {
-      try {
-        appData = JSON.parse(xhr.responseText);
-        onDataLoaded();
-      } catch(e) {
-        showError("Ошибка обработки данных (status " + xhr.status + ").");
-      }
-    } else {
-      showError("Сервер вернул ошибку " + xhr.status + ".");
+  function onDataLoaded() {
+    document.getElementById('masterInfo').textContent =
+      (appData.master_name || '') + ' · ⭐ ' + (appData.rating || '4.9');
+    document.getElementById('masterName2').textContent  = appData.master_name  || '';
+    document.getElementById('masterPhone2').textContent = appData.master_phone || '';
+    renderProcs();
+    document.getElementById('loadingBlock').style.display = 'none';
+    document.getElementById('procContent').style.display  = 'block';
+  }
+
+  function showError(msg) {
+    document.getElementById('loadingBlock').innerHTML =
+      '<div style="font-size:40px;margin-bottom:16px">😔</div><div>' + msg + '</div>';
+  }
+
+  function renderProcs() {
+    var list = document.getElementById('procList');
+    var procs = appData.procedures || [];
+    if (!procs.length) {
+      list.innerHTML = '<div class="empty">Нет доступных услуг</div>';
+      return;
     }
-  };
-  xhr.onerror = function() {
-    showError("Не удалось подключиться к серверу.<br><small>" + DATA_URL + "</small>");
-  };
-  xhr.ontimeout = function() {
-    showError("Сервер не отвечает (таймаут).");
-  };
-  xhr.send();
-}
+    var html = '';
+    for (var i = 0; i < procs.length; i++) {
+      var p = procs[i];
+      html += '<div class="proc-card" data-idx="' + i + '">' +
+        '<div class="proc-icon">' + ICONS[i % ICONS.length] + '</div>' +
+        '<div class="proc-info"><div class="proc-name">' + p.name + '</div>' +
+        '<div class="proc-meta">⏱ ' + p.dur + ' мин</div></div>' +
+        '<div class="proc-price">' + p.price + '</div></div>';
+    }
+    list.innerHTML = html;
 
-function onDataLoaded() {
-  document.getElementById('masterInfo').textContent =
-    (appData.master_name || '') + ' · ⭐ ' + (appData.rating || '4.9');
-  document.getElementById('masterName2').textContent  = appData.master_name  || '';
-  document.getElementById('masterPhone2').textContent = appData.master_phone || '';
-
-  renderProcs();
-  document.getElementById('loadingBlock').style.display = 'none';
-  document.getElementById('procContent').style.display  = 'block';
-}
-
-function showError(msg) {
-  document.getElementById('loadingBlock').innerHTML =
-    '<div style="font-size:40px;margin-bottom:16px">😔</div><div>' + msg + '</div>';
-}
-
-function renderProcs() {
-  var list = document.getElementById('procList');
-  var procs = appData.procedures || [];
-  if (!procs.length) {
-    list.innerHTML = '<div class="empty">Нет доступных услуг</div>';
-    return;
+    // Привязываем обработчики через addEventListener — надёжнее inline onclick
+    var cards = list.querySelectorAll('.proc-card');
+    for (var j = 0; j < cards.length; j++) {
+      cards[j].addEventListener('click', function() {
+        selectProc(parseInt(this.getAttribute('data-idx'), 10));
+      });
+    }
   }
-  list.innerHTML = procs.map(function(p, i) {
-    return '<div class="proc-card" id="proc' + i + '" onclick="selectProc(' + i + ')">' +
-      '<div class="proc-icon">' + (ICONS[i % ICONS.length]) + '</div>' +
-      '<div class="proc-info"><div class="proc-name">' + p.name + '</div>' +
-      '<div class="proc-meta">⏱ ' + p.dur + ' мин</div></div>' +
-      '<div class="proc-price">' + p.price + '</div></div>';
-  }).join('');
-}
 
-function selectProc(i) {
-  state.proc = i;
-  var cards = document.querySelectorAll('.proc-card');
-  for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
-  setTimeout(function() { goToStep(2); }, 300);
-}
-
-function renderDates() {
-  var dates = appData.dates || [];
-  var grid  = document.getElementById('dateGrid');
-  if (!dates.length) {
-    grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Свободных дат нет</div>';
-    return;
+  function selectProc(i) {
+    state.proc = i;
+    var cards = document.querySelectorAll('.proc-card');
+    for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
+    setTimeout(function() { goToStep(2); }, 250);
   }
-  grid.innerHTML = dates.map(function(d) {
-    var dt  = new Date(d.date + 'T00:00:00');
-    var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total/2) ? 'yellow' : 'red');
-    return '<div class="date-btn" id="date_' + d.date + '" onclick="selectDate(\'' + d.date + '\')">' +
-      '<div class="day-name">' + DAYS_S[dt.getDay()] + '</div>' +
-      '<div class="day-num">' + dt.getDate() + '</div>' +
-      '<div class="day-mon">' + MONTHS_S[dt.getMonth()] + '</div>' +
-      '<div class="dot ' + dot + '"></div></div>';
-  }).join('');
-}
 
-function selectDate(date) {
-  state.date = date; state.time = null;
-  var btns = document.querySelectorAll('.date-btn');
-  for (var i = 0; i < btns.length; i++)
-    btns[i].classList.toggle('selected', btns[i].id === 'date_' + date);
-  var d = null, dates = appData.dates || [];
-  for (var j = 0; j < dates.length; j++) if (dates[j].date === date) { d = dates[j]; break; }
-  var slots = d ? d.slots : [];
-  document.getElementById('timesTitle').style.display = slots.length ? 'block' : 'none';
-  document.getElementById('timesGrid').innerHTML = slots.map(function(t) {
-    return '<div class="time-btn" id="time_' + t.replace(':','_') + '" onclick="selectTime(\'' + t + '\')">' + t + '</div>';
-  }).join('');
-  // Не скрываем кнопку здесь — просто оставляем как есть до выбора времени
-}
+  function renderDates() {
+    var dates = appData.dates || [];
+    var grid  = document.getElementById('dateGrid');
+    if (!dates.length) {
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Свободных дат нет</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < dates.length; i++) {
+      var d   = dates[i];
+      var dt  = new Date(d.date + 'T00:00:00');
+      var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total/2) ? 'yellow' : 'red');
+      html += '<div class="date-btn" data-date="' + d.date + '">' +
+        '<div class="day-name">' + DAYS_S[dt.getDay()] + '</div>' +
+        '<div class="day-num">' + dt.getDate() + '</div>' +
+        '<div class="day-mon">' + MONTHS_S[dt.getMonth()] + '</div>' +
+        '<div class="dot ' + dot + '"></div></div>';
+    }
+    grid.innerHTML = html;
 
-function selectTime(t) {
-  state.time = t;
-  var btns = document.querySelectorAll('.time-btn');
-  for (var i = 0; i < btns.length; i++)
-    btns[i].classList.toggle('selected', btns[i].id === 'time_' + t.replace(':','_'));
-  // Автоматически переходим дальше через небольшую паузу — без ожидания клика по кнопке
-  setTimeout(function() { goToStep(3); }, 300);
-}
+    var btns = grid.querySelectorAll('.date-btn');
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].addEventListener('click', function() {
+        selectDate(this.getAttribute('data-date'));
+      });
+    }
+  }
 
-function renderSummary() {
-  var p = (appData.procedures || [])[state.proc] || {};
-  var dt = new Date(state.date + 'T00:00:00');
-  var dateStr = DAYS_S[dt.getDay()] + ', ' + dt.getDate() + ' ' + MONTHS_S[dt.getMonth()];
-  document.getElementById('summaryCard').innerHTML =
-    row('💆','Процедура', p.name || '—') +
-    row('📅','Дата и время', dateStr + ' в ' + state.time) +
-    row('⏱','Длительность', p.dur + ' мин') +
-    row('💰','Стоимость', p.price) +
-    row('👤','Клиент', tgUser.first_name || 'Клиент');
-}
+  function selectDate(date) {
+    state.date = date; state.time = null;
+    var btns = document.querySelectorAll('.date-btn');
+    for (var i = 0; i < btns.length; i++)
+      btns[i].classList.toggle('selected', btns[i].getAttribute('data-date') === date);
 
-function row(icon, label, value) {
-  return '<div class="summary-row"><div class="summary-icon">' + icon + '</div>' +
-    '<div><div class="summary-label">' + label + '</div>' +
-    '<div class="summary-value">' + value + '</div></div></div>';
-}
+    var d = null, dates = appData.dates || [];
+    for (var j = 0; j < dates.length; j++) if (dates[j].date === date) { d = dates[j]; break; }
+    var slots = d ? d.slots : [];
 
-function showBtn(text) {
-  if (tg && tg.MainButton) {
-    try {
+    document.getElementById('timesTitle').style.display = slots.length ? 'block' : 'none';
+    var timesGrid = document.getElementById('timesGrid');
+    var html = '';
+    for (var k = 0; k < slots.length; k++) {
+      html += '<div class="time-btn" data-time="' + slots[k] + '">' + slots[k] + '</div>';
+    }
+    timesGrid.innerHTML = html;
+
+    var tbtns = timesGrid.querySelectorAll('.time-btn');
+    for (var m = 0; m < tbtns.length; m++) {
+      tbtns[m].addEventListener('click', function() {
+        selectTime(this.getAttribute('data-time'));
+      });
+    }
+  }
+
+  function selectTime(t) {
+    state.time = t;
+    var btns = document.querySelectorAll('.time-btn');
+    for (var i = 0; i < btns.length; i++)
+      btns[i].classList.toggle('selected', btns[i].getAttribute('data-time') === t);
+    setTimeout(function() { goToStep(3); }, 250);
+  }
+
+  function renderSummary() {
+    var p  = (appData.procedures || [])[state.proc] || {};
+    var dt = new Date(state.date + 'T00:00:00');
+    var dateStr = DAYS_S[dt.getDay()] + ', ' + dt.getDate() + ' ' + MONTHS_S[dt.getMonth()];
+    document.getElementById('summaryCard').innerHTML =
+      row('💆','Процедура', p.name || '—') +
+      row('📅','Дата и время', dateStr + ' в ' + state.time) +
+      row('⏱','Длительность', p.dur + ' мин') +
+      row('💰','Стоимость', p.price) +
+      row('👤','Клиент', tgUser.first_name || 'Клиент');
+  }
+
+  function row(icon, label, value) {
+    return '<div class="summary-row"><div class="summary-icon">' + icon + '</div>' +
+      '<div><div class="summary-label">' + label + '</div>' +
+      '<div class="summary-value">' + value + '</div></div></div>';
+  }
+
+  function goToStep(n) {
+    var screens = document.querySelectorAll('.screen');
+    for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('active', i+1 === n);
+    for (var j = 1; j <= 4; j++) {
+      var el = document.getElementById('step' + j);
+      el.className = 'step' + (j < n ? ' done' : j === n ? ' active' : '');
+      el.textContent = j < n ? '✓' : j;
+    }
+    state.step = n;
+
+    if (n === 2) {
+      renderDates();
+      hideMainButton();
+    }
+    if (n === 3) {
+      renderSummary();
+      showMainButton('Отправить заявку ✓', submitBooking);
+    }
+  }
+
+  function showMainButton(text, callback) {
+    if (tg && tg.MainButton) {
       tg.MainButton.setText(text);
-      tg.MainButton.enable();
+      tg.MainButton.offClick(currentMainButtonHandler);
+      currentMainButtonHandler = callback;
+      tg.MainButton.onClick(currentMainButtonHandler);
       tg.MainButton.show();
-    } catch(e) {
-      console.log('MainButton error:', e.message);
+      tg.MainButton.enable();
     }
   }
-}
-function hideBtn() {
-  if (tg && tg.MainButton) {
-    try { tg.MainButton.hide(); } catch(e) {}
+  function hideMainButton() {
+    if (tg && tg.MainButton) {
+      tg.MainButton.hide();
+    }
   }
-}
+  var currentMainButtonHandler = null;
 
-function goToStep(n) {
-  var screens = document.querySelectorAll('.screen');
-  for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('active', i+1 === n);
-  for (var j = 1; j <= 4; j++) {
-    var el = document.getElementById('step' + j);
-    el.className = 'step' + (j < n ? ' done' : j === n ? ' active' : '');
-    el.textContent = j < n ? '✓' : j;
+  function submitBooking() {
+    var p = (appData.procedures || [])[state.proc] || {};
+    var payload = JSON.stringify({
+      action: 'book', proc_idx: state.proc,
+      proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
+      date: state.date, time: state.time,
+    });
+    if (tg && tg.sendData) {
+      tg.sendData(payload);
+    }
   }
-  state.step = n; hideBtn();
-  if (n === 2) renderDates();
-  if (n === 3) { renderSummary(); }
-}
 
-function handleNextClick() {
-  if (state.step === 1 && state.proc !== null) goToStep(2);
-  else if (state.step === 2 && state.date && state.time) goToStep(3);
-  else if (state.step === 3) submitBooking();
-}
-
-if (tg && tg.MainButton) {
-  tg.MainButton.onClick(handleNextClick);
-}
-
-function submitBooking() {
-  var p = (appData.procedures || [])[state.proc] || {};
-  var payload = JSON.stringify({
-    action: 'book', proc_idx: state.proc,
-    proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
-    date: state.date, time: state.time,
-  });
-  if (tg && tg.sendData) {
-    try { tg.sendData(payload); } catch(e) {}
-  }
-}
-
-// Явно делаем функции глобальными — для надёжности в мобильных WebView
-window.selectProc = selectProc;
-window.selectDate = selectDate;
-window.selectTime = selectTime;
-window.submitBooking = submitBooking;
-
-loadData();
+  loadData();
 </script>
 </body>
 </html>
