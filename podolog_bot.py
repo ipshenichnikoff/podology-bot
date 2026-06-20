@@ -680,9 +680,10 @@ def get_webapp_data() -> dict:
     }
 
 def build_webapp_url(uid: int) -> str:
-    import urllib.parse
+    import urllib.parse, time
     data_url = BOT_HOST.rstrip("/") + "/webapp-data"
-    return f"{WEBAPP_URL}?data_url={urllib.parse.quote(data_url)}"
+    cache_bust = int(time.time())  # каждый раз новый, чтобы Telegram не кэшировал страницу
+    return f"{WEBAPP_URL}?v={cache_bust}&data_url={urllib.parse.quote(data_url)}"
 
 def kb_main(uid):
     client = get_client(uid)
