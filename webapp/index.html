@@ -108,7 +108,6 @@
 <div class="header">
   <h1>💆 Запись к подологу</h1>
   <p id="masterInfo">Загрузка...</p>
-  <p id="debugLine" style="font-size:10px;opacity:0.6;margin-top:6px;word-break:break-all"></p>
 </div>
 
 <div class="steps">
@@ -168,30 +167,14 @@
 var tg = null;
 var tgUser = { first_name: 'Клиент', id: 0 };
 
-// Инициализация Telegram WebApp
-var debugInfo = [];
-try {
-  debugInfo.push('window.Telegram exists: ' + !!window.Telegram);
-  if (window.Telegram) {
-    debugInfo.push('window.Telegram.WebApp exists: ' + !!window.Telegram.WebApp);
+if (window.Telegram && window.Telegram.WebApp) {
+  tg = window.Telegram.WebApp;
+  tg.expand();
+  tg.ready();
+  if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+    tgUser = tg.initDataUnsafe.user;
   }
-  if (window.Telegram && window.Telegram.WebApp) {
-    tg = window.Telegram.WebApp;
-    tg.expand();
-    tg.ready();
-    debugInfo.push('tg.initData length: ' + (tg.initData || '').length);
-    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-      tgUser = tg.initDataUnsafe.user;
-      debugInfo.push('user found: ' + tgUser.first_name);
-    } else {
-      debugInfo.push('no user in initDataUnsafe');
-    }
-  }
-} catch(e) {
-  debugInfo.push('ERROR: ' + e.message);
 }
-console.log('Telegram WebApp debug:', debugInfo.join(' | '));
-try { document.getElementById('debugLine').textContent = debugInfo.join(' | '); } catch(e) {}
 
 var appData = { procedures: [], dates: [] };
 var state   = { step: 1, proc: null, date: null, time: null };
@@ -392,20 +375,13 @@ function goToStep(n) {
 }
 
 function handleNextClick() {
-  console.log('CLICK: step=' + state.step + ' proc=' + state.proc + ' date=' + state.date + ' time=' + state.time);
   if (state.step === 1 && state.proc !== null) goToStep(2);
   else if (state.step === 2 && state.date && state.time) goToStep(3);
   else if (state.step === 3) submitBooking();
-  else {
-    alert('Клик не обработан. step=' + state.step + ' proc=' + state.proc + ' date=' + state.date + ' time=' + state.time);
-  }
 }
 
 if (tg && tg.MainButton) {
-  tg.MainButton.onClick(function() {
-    console.log('MainButton clicked!');
-    handleNextClick();
-  });
+  tg.MainButton.onClick(handleNextClick);
 }
 
 function submitBooking() {
@@ -415,21 +391,16 @@ function submitBooking() {
     proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
     date: state.date, time: state.time,
   });
-
-  if (!tg) {
-    alert('Telegram WebApp недоступен. Откройте приложение через кнопку в боте.');
-    return;
-  }
-  if (!tg.sendData) {
-    alert('tg.sendData недоступен в этой версии Telegram.');
-    return;
-  }
-  try {
-    tg.sendData(payload);
-  } catch(e) {
-    alert('Ошибка отправки: ' + e.message);
+  if (tg && tg.sendData) {
+    try { tg.sendData(payload); } catch(e) {}
   }
 }
+
+// Явно делаем функции глобальными — для надёжности в мобильных WebView
+window.selectProc = selectProc;
+window.selectDate = selectDate;
+window.selectTime = selectTime;
+window.submitBooking = submitBooking;
 
 loadData();
 </script>
