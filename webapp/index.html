@@ -355,14 +355,78 @@
 
   function submitBooking() {
     var p = (appData.procedures || [])[state.proc] || {};
-    var payload = JSON.stringify({
-      action: 'book', proc_idx: state.proc,
-      proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
-      date: state.date, time: state.time,
-    });
-    if (tg && tg.sendData) {
-      tg.sendData(payload);
+    var uid = tgUser.id || 0;
+
+    // Основной способ — прямой запрос к боту (надёжнее на мобильных платформах)
+    if (uid && DATA_URL) {
+      var bookUrl = DATA_URL.replace('/webapp-data', '/webapp-book');
+      var body = {
+        uid: uid,
+        proc_idx: state.proc,
+        proc_name: p.name,
+        proc_dur: p.dur,
+        proc_price_raw: p.price_raw,
+        date: state.date,
+        time: state.time,
+        user_name: tgUser.first_name || 'Клиент',
+      };
+
+      showLoadingState();
+
+      fetch(bookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(function(res) { return res.json(); })
+        .then(function(result) {
+          if (result.ok) {
+            goToStep(4);
+            setTimeout(function() {
+              if (tg && tg.close) tg.close();
+            }, 1800);
+          } else {
+            showBookingError(result.error || 'Не удалось отправить заявку');
+          }
+        })
+        .catch(function(err) {
+          // Fallback на sendData если прямой запрос не прошёл
+          if (tg && tg.sendData) {
+            try {
+              tg.sendData(JSON.stringify({
+                action: 'book', proc_idx: state.proc,
+                proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
+                date: state.date, time: state.time,
+              }));
+              return;
+            } catch(e) {}
+          }
+          showBookingError('Ошибка соединения: ' + err.message);
+        });
+      return;
     }
+
+    // Fallback — старый способ через sendData
+    if (tg && tg.sendData) {
+      tg.sendData(JSON.stringify({
+        action: 'book', proc_idx: state.proc,
+        proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
+        date: state.date, time: state.time,
+      }));
+    }
+  }
+
+  function showLoadingState() {
+    var card = document.getElementById('summaryCard');
+    if (card) card.style.opacity = '0.5';
+    hideMainButton();
+  }
+
+  function showBookingError(msg) {
+    var card = document.getElementById('summaryCard');
+    if (card) card.style.opacity = '1';
+    showMainButton('Повторить попытку', submitBooking);
+    alert(msg);
   }
 
   loadData();

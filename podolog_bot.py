@@ -4,6 +4,7 @@ PODOLOG BOT — стабильная версия.
 Установка: pip install "python-telegram-bot[job-queue]"
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -125,13 +126,19 @@ _lock = threading.Lock()
 # HTTP СЕРВЕР ДЛЯ MINI APP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Глобальная ссылка на event loop бота — нужна чтобы запускать async-код
+# из синхронных обработчиков FastAPI (они работают в отдельном потоке).
+_bot_loop = None
+_bot_app  = None
+
 def start_http_server():
     """Запускает FastAPI сервер — bothost использует его как обёртку."""
     try:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse, PlainTextResponse
         from fastapi.middleware.cors import CORSMiddleware
         import uvicorn
+        import asyncio
 
         app_api = FastAPI()
         app_api.add_middleware(
@@ -149,6 +156,46 @@ def start_http_server():
         @app_api.get("/webapp-data")
         def webapp_data():
             return JSONResponse(get_webapp_data())
+
+        @app_api.post("/webapp-book")
+        async def webapp_book(request: Request):
+            """
+            Принимает заявку напрямую от Mini App через fetch (вместо tg.sendData).
+            Это надёжнее на мобильных платформах где sendData может работать нестабильно.
+            """
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+
+            uid       = body.get("uid")
+            proc_idx  = body.get("proc_idx", 0)
+            proc_name = body.get("proc_name", "")
+            date      = body.get("date", "")
+            time      = body.get("time", "")
+            pf        = body.get("proc_price_raw", 0)
+            dur       = body.get("proc_dur", 60)
+            name      = body.get("user_name", "Клиент")
+
+            if not uid or not date or not time or not proc_name:
+                return JSONResponse({"ok": False, "error": "missing fields"}, status_code=400)
+
+            uid = int(uid)
+
+            # Запускаем обработку в event loop бота
+            if _bot_loop and _bot_app:
+                future = asyncio.run_coroutine_threadsafe(
+                    _process_webapp_booking(uid, proc_idx, proc_name, date, time, pf, dur, name),
+                    _bot_loop
+                )
+                try:
+                    result = future.result(timeout=10)
+                    return JSONResponse(result)
+                except Exception as e:
+                    log.error("Ошибка обработки веб-заявки: %s", e)
+                    return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+            else:
+                return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=503)
 
         port = int(os.getenv("PORT", "3000"))
         log.info("FastAPI сервер запущен на порту %d", port)
@@ -1394,6 +1441,69 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ОБРАБОТЧИК КОНТАКТА И ТЕКСТА
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _process_webapp_booking(uid, proc_idx, proc_name, date, time, pf, dur, name):
+    """
+    Общая логика обработки заявки из Mini App.
+    Используется и из tg.sendData (on_web_app_data), и из прямого HTTP POST (/webapp-book).
+    Возвращает dict с результатом для ответа клиенту.
+    """
+    bot = _bot_app.bot
+    client = get_client(uid)
+    phone  = client["phone"] if client and client.get("phone") else None
+
+    if not phone:
+        # Просим телефон через обычный чат с ботом
+        try:
+            await bot.send_message(
+                uid, "📱 Для завершения записи нужен ваш номер телефона.\n\n"
+                     "Нажмите кнопку ниже 👇")
+            await bot.send_message(uid, "Поделитесь номером:",
+                                    reply_markup=kb_phone())
+        except Exception as e:
+            log.warning("Не удалось запросить телефон: %s", e)
+        # Сохраняем контекст записи во временную БД-таблицу clients, чтобы
+        # подхватить её когда придёт номер телефона через on_contact/on_message.
+        # Простое решение: используем глобальный словарь в памяти.
+        _pending_bookings[uid] = dict(
+            proc=proc_name, dur=dur, price=pf, date=date, time=time, name=name
+        )
+        return {"ok": True, "status": "phone_requested"}
+
+    try:
+        apt_id = add_apt(date, time, name, phone, uid, proc_name, dur, pf)
+    except ValueError as e:
+        try:
+            await bot.send_message(uid, str(e), reply_markup=kb_main(uid))
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 *Новая заявка (Mini App)!*\n\n👤 {name}  📱 {phone}\n💆 {proc_name}\n"
+            f"📅 {fmt_date(date)} в {time}\n💰 {pf:,} ₽\n\nПодтвердите:".replace(",", " "),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
+                InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
+            ]]), parse_mode="Markdown")
+    except Exception as e:
+        log.warning("Не удалось уведомить админа: %s", e)
+
+    try:
+        await bot.send_message(
+            uid,
+            f"🎉 *Заявка отправлена!*\n\n💆 {proc_name}\n📅 {fmt_date(date)} в {time}\n\n"
+            "⏳ Мастер подтвердит запись в ближайшее время.",
+            parse_mode="Markdown", reply_markup=kb_main(uid))
+    except Exception as e:
+        log.warning("Не удалось уведомить клиента: %s", e)
+
+    return {"ok": True, "status": "booked", "apt_id": apt_id}
+
+# Временное хранилище незавершённых записей (ждут номер телефона)
+_pending_bookings = {}
+
 async def on_web_app_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import json
     log.info("WEB_APP_DATA получено от uid=%s: %s", update.effective_user.id,
@@ -1441,6 +1551,35 @@ async def on_web_app_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     phone = update.message.contact.phone_number
     if not phone.startswith("+"): phone = "+" + phone
+    uid = update.effective_user.id
+
+    # Если есть незавершённая запись из Mini App — обрабатываем здесь
+    if uid in _pending_bookings:
+        pending = _pending_bookings.pop(uid)
+        await update.message.reply_text(f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
+        try:
+            apt_id = add_apt(pending["date"], pending["time"], pending["name"], phone,
+                              uid, pending["proc"], pending["dur"], pending["price"])
+        except ValueError as e:
+            await update.message.reply_text(str(e), reply_markup=kb_main(uid)); return
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"🔔 *Новая заявка (Mini App)!*\n\n👤 {pending['name']}  📱 {phone}\n"
+                f"💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n"
+                f"💰 {pending['price']:,} ₽\n\nПодтвердите:".replace(",", " "),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
+                    InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
+                ]]), parse_mode="Markdown")
+        except Exception: pass
+        set_state(ctx, ST_MAIN)
+        await update.message.reply_text(
+            f"🎉 *Заявка отправлена!*\n\n💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n\n"
+            "⏳ Мастер подтвердит запись в ближайшее время.",
+            parse_mode="Markdown", reply_markup=kb_main(uid))
+        return
+
     ctx.user_data["phone"] = phone
     await update.message.reply_text(f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
     set_state(ctx, ST_CONFIRM)
@@ -1453,6 +1592,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_rate_limited(uid):
         await update.message.reply_text("⏳ Не так быстро!"); return
+
+    # Если есть незавершённая запись из Mini App (HTTP-флоу) — обрабатываем номер здесь
+    if uid in _pending_bookings:
+        if not validate_phone(text):
+            await update.message.reply_text("❌ Неверный формат. Нажмите кнопку ниже 👇", reply_markup=kb_phone()); return
+        phone = re.sub(r"\D", "", text)
+        if phone.startswith("8"): phone = "7" + phone[1:]
+        phone = "+" + phone
+        pending = _pending_bookings.pop(uid)
+        await update.message.reply_text("✅ Номер принят.", reply_markup=ReplyKeyboardRemove())
+        try:
+            apt_id = add_apt(pending["date"], pending["time"], pending["name"], phone,
+                              uid, pending["proc"], pending["dur"], pending["price"])
+        except ValueError as e:
+            await update.message.reply_text(str(e), reply_markup=kb_main(uid)); return
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"🔔 *Новая заявка (Mini App)!*\n\n👤 {pending['name']}  📱 {phone}\n"
+                f"💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n"
+                f"💰 {pending['price']:,} ₽\n\nПодтвердите:".replace(",", " "),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
+                    InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
+                ]]), parse_mode="Markdown")
+        except Exception: pass
+        set_state(ctx, ST_MAIN)
+        await update.message.reply_text(
+            f"🎉 *Заявка отправлена!*\n\n💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n\n"
+            "⏳ Мастер подтвердит запись в ближайшее время.",
+            parse_mode="Markdown", reply_markup=kb_main(uid))
+        return
 
     if state == ST_PHONE:
         if not validate_phone(text):
@@ -1505,10 +1676,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _post_init(app):
+    """Вызывается после старта event loop — сохраняем ссылки для HTTP сервера."""
+    global _bot_app, _bot_loop
+    _bot_app  = app
+    _bot_loop = asyncio.get_running_loop()
+    log.info("Bot app и event loop зарегистрированы для HTTP сервера")
+
 def main():
     init_db()
     persistence = PicklePersistence(filepath="podolog_data")
-    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .persistence(persistence)
+           .post_init(_post_init)
+           .build())
 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("book",    cmd_book))
