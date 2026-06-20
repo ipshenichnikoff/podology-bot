@@ -408,6 +408,7 @@ if (tg && tg.MainButton) {
 }
 
 function submitBooking() {
+  alert('Кнопка нажата! step=' + state.step + ' proc=' + state.proc);
   var p = (appData.procedures || [])[state.proc] || {};
   var payload = JSON.stringify({
     action: 'book', proc_idx: state.proc,
