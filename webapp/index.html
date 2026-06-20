@@ -140,6 +140,9 @@
       <div class="master-meta" id="masterPhone2">—</div>
     </div>
   </div>
+  <button onclick="submitBooking()" style="width:100%;margin-top:16px;background:var(--primary);color:white;border:none;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer">
+    Отправить заявку ✓
+  </button>
 </div>
 
 <div class="screen" id="screen4">
@@ -286,7 +289,7 @@ function selectProc(i) {
   state.proc = i;
   var cards = document.querySelectorAll('.proc-card');
   for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
-  showBtn('Выбрать дату →');
+  setTimeout(function() { goToStep(2); }, 300);
 }
 
 function renderDates() {
@@ -327,7 +330,8 @@ function selectTime(t) {
   var btns = document.querySelectorAll('.time-btn');
   for (var i = 0; i < btns.length; i++)
     btns[i].classList.toggle('selected', btns[i].id === 'time_' + t.replace(':','_'));
-  showBtn('Продолжить →');
+  // Автоматически переходим дальше через небольшую паузу — без ожидания клика по кнопке
+  setTimeout(function() { goToStep(3); }, 300);
 }
 
 function renderSummary() {
@@ -382,7 +386,7 @@ function goToStep(n) {
   }
   state.step = n; hideBtn();
   if (n === 2) renderDates();
-  if (n === 3) { renderSummary(); showBtn('Отправить заявку ✓'); }
+  if (n === 3) { renderSummary(); }
 }
 
 function handleNextClick() {
