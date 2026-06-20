@@ -1700,6 +1700,20 @@ def main():
     app.add_handler(CommandHandler("about",   cmd_about))
     app.add_handler(CommandHandler("export",  cmd_export))
     app.add_handler(CommandHandler("admin",   cmd_admin))
+
+    # Диагностика: логируем абсолютно все входящие сообщения (группа -1 = раньше остальных,
+    # не блокирует дальнейшую обработку благодаря отдельной группе)
+    async def _log_all_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.message:
+            wad = getattr(update.message, "web_app_data", None)
+            log.info(
+                "RAW UPDATE: uid=%s text=%r web_app_data=%r",
+                update.effective_user.id if update.effective_user else "?",
+                update.message.text,
+                wad.data if wad else None,
+            )
+    app.add_handler(MessageHandler(filters.ALL, _log_all_messages), group=-1)
+
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))

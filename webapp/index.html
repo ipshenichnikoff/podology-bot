@@ -361,14 +361,9 @@
       date: state.date, time: state.time,
     });
 
-    // Временная диагностика — показываем что именно отправляем
-    alert('Отправляю:\n' + payload + '\n\ntg доступен: ' + !!tg + '\nsendData доступен: ' + !!(tg && tg.sendData));
-
     if (tg && tg.sendData) {
-      hideMainButton();
       try {
         tg.sendData(payload);
-        alert('sendData вызван без ошибок');
       } catch(e) {
         alert('ОШИБКА sendData: ' + e.message);
       }
