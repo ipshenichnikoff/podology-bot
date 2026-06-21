@@ -157,6 +157,19 @@ def start_http_server():
         def webapp_data():
             return JSONResponse(get_webapp_data())
 
+        @app_api.get("/webapp-page")
+        def webapp_page():
+            """
+            Возвращает полностью самодостаточную HTML-страницу с данными,
+            встроенными прямо в разметку (без runtime fetch к /webapp-data).
+            Это устраняет асинхронность при загрузке, которая может мешать
+            корректной работе tg.sendData() на некоторых платформах (iOS).
+            """
+            from fastapi.responses import HTMLResponse
+            data = get_webapp_data()
+            html = render_webapp_html(data)
+            return HTMLResponse(html)
+
         @app_api.post("/webapp-book")
         async def webapp_book(request: Request):
             """
@@ -709,6 +722,333 @@ async def _process_reminders(ctx: ContextTypes.DEFAULT_TYPE):
 # КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def render_webapp_html(data: dict) -> str:
+    """
+    Генерирует полностью самодостаточную HTML-страницу Mini App
+    с данными, встроенными прямо в JS (без отдельного fetch-запроса).
+    """
+    import json as _json
+    data_json = _json.dumps(data, ensure_ascii=False)
+
+    return """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Запись к подологу</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #f5f5f5; --card: #ffffff;
+    --primary: #e91e8c; --primary-light: #fce4f3;
+    --text: #1a1a1a; --text-muted: #888;
+    --border: #eee; --radius: 16px;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; padding-bottom: 30px;
+  }
+  .header {
+    background: linear-gradient(135deg, #e91e8c, #c2185b);
+    color: white; padding: 20px 16px 24px; text-align: center;
+  }
+  .header h1 { font-size: 20px; font-weight: 700; }
+  .header p  { font-size: 13px; opacity: 0.85; margin-top: 4px; }
+  .steps {
+    display: flex; justify-content: center; gap: 8px;
+    padding: 16px; background: white; border-bottom: 1px solid var(--border);
+  }
+  .step {
+    width: 32px; height: 32px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 600;
+    background: var(--border); color: var(--text-muted); transition: all .3s;
+  }
+  .step.active { background: var(--primary); color: white; }
+  .step.done   { background: #4caf50; color: white; }
+  .step-line   { flex: 1; height: 2px; background: var(--border); align-self: center; max-width: 40px; }
+  .screen { display: none; padding: 16px; }
+  .screen.active { display: block; }
+  .section-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; }
+  .proc-card {
+    background: var(--card); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 10px;
+    border: 2px solid transparent; cursor: pointer; display: flex; align-items: center; gap: 12px;
+  }
+  .proc-card.selected { border-color: var(--primary); background: var(--primary-light); }
+  .proc-icon {
+    width: 44px; height: 44px; border-radius: 12px; background: var(--primary-light);
+    display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0;
+  }
+  .proc-info { flex: 1; }
+  .proc-name { font-size: 15px; font-weight: 600; }
+  .proc-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .proc-price { font-size: 14px; font-weight: 700; color: var(--primary); white-space: nowrap; }
+  .dates-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+  .date-btn {
+    background: var(--card); border: 2px solid transparent;
+    border-radius: 12px; padding: 10px 4px; text-align: center; cursor: pointer;
+  }
+  .date-btn.selected { border-color: var(--primary); background: var(--primary-light); }
+  .date-btn .day-name { font-size: 11px; color: var(--text-muted); }
+  .date-btn .day-num  { font-size: 18px; font-weight: 700; margin: 2px 0; }
+  .date-btn .day-mon  { font-size: 11px; color: var(--text-muted); }
+  .date-btn .dot { width: 6px; height: 6px; border-radius: 50%; margin: 4px auto 0; }
+  .dot.green { background: #4caf50; } .dot.yellow { background: #ff9800; } .dot.red { background: #f44336; }
+  .times-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .time-btn {
+    background: var(--card); border: 2px solid transparent;
+    border-radius: 12px; padding: 12px 8px; text-align: center;
+    font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  .time-btn.selected { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
+  .summary-card { background: var(--card); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+  .summary-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .summary-row:last-child { border-bottom: none; }
+  .summary-icon { font-size: 20px; width: 28px; text-align: center; flex-shrink: 0; }
+  .summary-label { font-size: 12px; color: var(--text-muted); }
+  .summary-value { font-size: 15px; font-weight: 600; margin-top: 2px; }
+  .master-card { background: var(--card); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .master-avatar { width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, #e91e8c, #c2185b); display: flex; align-items: center; justify-content: center; font-size: 24px; flex-shrink: 0; }
+  .master-name { font-size: 15px; font-weight: 700; }
+  .master-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .success-screen { text-align: center; padding: 40px 20px; }
+  .success-icon { font-size: 64px; margin-bottom: 16px; }
+  .success-screen h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .success-screen p  { color: var(--text-muted); font-size: 14px; line-height: 1.5; }
+  .empty { text-align: center; color: var(--text-muted); padding: 32px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>💆 Запись к подологу</h1>
+  <p id="masterInfo">""" + data.get("master_name", "") + """ · ⭐ """ + str(data.get("rating", "4.9")) + """</p>
+</div>
+
+<div class="steps">
+  <div class="step active" id="step1">1</div>
+  <div class="step-line"></div>
+  <div class="step" id="step2">2</div>
+  <div class="step-line"></div>
+  <div class="step" id="step3">3</div>
+  <div class="step-line"></div>
+  <div class="step" id="step4">✓</div>
+</div>
+
+<div class="screen active" id="screen1">
+  <div class="section-title">Выберите процедуру</div>
+  <div id="procList"></div>
+</div>
+
+<div class="screen" id="screen2">
+  <div class="section-title">Выберите дату</div>
+  <div class="dates-grid" id="dateGrid"></div>
+  <div class="section-title" id="timesTitle" style="display:none">Выберите время</div>
+  <div class="times-grid" id="timesGrid"></div>
+</div>
+
+<div class="screen" id="screen3">
+  <div class="section-title">Подтверждение записи</div>
+  <div class="summary-card" id="summaryCard"></div>
+  <div class="master-card">
+    <div class="master-avatar">👩‍⚕️</div>
+    <div>
+      <div class="master-name">""" + data.get("master_name", "") + """</div>
+      <div class="master-meta">""" + data.get("master_phone", "") + """</div>
+    </div>
+  </div>
+</div>
+
+<div class="screen" id="screen4">
+  <div class="success-screen">
+    <div class="success-icon">🎉</div>
+    <h2>Заявка отправлена!</h2>
+    <p>Мастер подтвердит запись в ближайшее время.<br>Вы получите уведомление в этом чате.</p>
+  </div>
+</div>
+
+<script>
+  // Данные встроены статически — никакого fetch при загрузке не требуется.
+  // Это устраняет асинхронность, которая могла мешать tg.sendData() на iOS.
+  var appData = """ + data_json + """;
+
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  var tgUser = { first_name: 'Клиент', id: 0 };
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      tgUser = tg.initDataUnsafe.user;
+    }
+  }
+
+  var state = { step: 1, proc: null, date: null, time: null };
+  var ICONS    = ['🦶','🩺','💉','💅','🔧','⚙️','🛡️','🩹','🔬'];
+  var MONTHS_S = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+  var DAYS_S   = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+
+  function renderProcs() {
+    var list = document.getElementById('procList');
+    var procs = appData.procedures || [];
+    if (!procs.length) {
+      list.innerHTML = '<div class="empty">Нет доступных услуг</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < procs.length; i++) {
+      var p = procs[i];
+      html += '<div class="proc-card" data-idx="' + i + '">' +
+        '<div class="proc-icon">' + ICONS[i % ICONS.length] + '</div>' +
+        '<div class="proc-info"><div class="proc-name">' + p.name + '</div>' +
+        '<div class="proc-meta">⏱ ' + p.dur + ' мин</div></div>' +
+        '<div class="proc-price">' + p.price + '</div></div>';
+    }
+    list.innerHTML = html;
+    var cards = list.querySelectorAll('.proc-card');
+    for (var j = 0; j < cards.length; j++) {
+      cards[j].addEventListener('click', function() {
+        selectProc(parseInt(this.getAttribute('data-idx'), 10));
+      });
+    }
+  }
+
+  function selectProc(i) {
+    state.proc = i;
+    var cards = document.querySelectorAll('.proc-card');
+    for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
+    setTimeout(function() { goToStep(2); }, 250);
+  }
+
+  function renderDates() {
+    var dates = appData.dates || [];
+    var grid  = document.getElementById('dateGrid');
+    if (!dates.length) {
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Свободных дат нет</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < dates.length; i++) {
+      var d   = dates[i];
+      var dt  = new Date(d.date + 'T00:00:00');
+      var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total/2) ? 'yellow' : 'red');
+      html += '<div class="date-btn" data-date="' + d.date + '">' +
+        '<div class="day-name">' + DAYS_S[dt.getDay()] + '</div>' +
+        '<div class="day-num">' + dt.getDate() + '</div>' +
+        '<div class="day-mon">' + MONTHS_S[dt.getMonth()] + '</div>' +
+        '<div class="dot ' + dot + '"></div></div>';
+    }
+    grid.innerHTML = html;
+    var btns = grid.querySelectorAll('.date-btn');
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].addEventListener('click', function() {
+        selectDate(this.getAttribute('data-date'));
+      });
+    }
+  }
+
+  function selectDate(date) {
+    state.date = date; state.time = null;
+    var btns = document.querySelectorAll('.date-btn');
+    for (var i = 0; i < btns.length; i++)
+      btns[i].classList.toggle('selected', btns[i].getAttribute('data-date') === date);
+    var d = null, dates = appData.dates || [];
+    for (var j = 0; j < dates.length; j++) if (dates[j].date === date) { d = dates[j]; break; }
+    var slots = d ? d.slots : [];
+    document.getElementById('timesTitle').style.display = slots.length ? 'block' : 'none';
+    var timesGrid = document.getElementById('timesGrid');
+    var html = '';
+    for (var k = 0; k < slots.length; k++) {
+      html += '<div class="time-btn" data-time="' + slots[k] + '">' + slots[k] + '</div>';
+    }
+    timesGrid.innerHTML = html;
+    var tbtns = timesGrid.querySelectorAll('.time-btn');
+    for (var m = 0; m < tbtns.length; m++) {
+      tbtns[m].addEventListener('click', function() {
+        selectTime(this.getAttribute('data-time'));
+      });
+    }
+  }
+
+  function selectTime(t) {
+    state.time = t;
+    var btns = document.querySelectorAll('.time-btn');
+    for (var i = 0; i < btns.length; i++)
+      btns[i].classList.toggle('selected', btns[i].getAttribute('data-time') === t);
+    setTimeout(function() { goToStep(3); }, 250);
+  }
+
+  function renderSummary() {
+    var p  = (appData.procedures || [])[state.proc] || {};
+    var dt = new Date(state.date + 'T00:00:00');
+    var dateStr = DAYS_S[dt.getDay()] + ', ' + dt.getDate() + ' ' + MONTHS_S[dt.getMonth()];
+    document.getElementById('summaryCard').innerHTML =
+      row('💆','Процедура', p.name || '—') +
+      row('📅','Дата и время', dateStr + ' в ' + state.time) +
+      row('⏱','Длительность', p.dur + ' мин') +
+      row('💰','Стоимость', p.price) +
+      row('👤','Клиент', tgUser.first_name || 'Клиент');
+  }
+
+  function row(icon, label, value) {
+    return '<div class="summary-row"><div class="summary-icon">' + icon + '</div>' +
+      '<div><div class="summary-label">' + label + '</div>' +
+      '<div class="summary-value">' + value + '</div></div></div>';
+  }
+
+  function goToStep(n) {
+    var screens = document.querySelectorAll('.screen');
+    for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('active', i+1 === n);
+    for (var j = 1; j <= 4; j++) {
+      var el = document.getElementById('step' + j);
+      el.className = 'step' + (j < n ? ' done' : j === n ? ' active' : '');
+      el.textContent = j < n ? '✓' : j;
+    }
+    state.step = n;
+    if (n === 2) { renderDates(); hideMainButton(); }
+    if (n === 3) { renderSummary(); showMainButton('Отправить заявку ✓', submitBooking); }
+  }
+
+  var currentMainButtonHandler = null;
+  function showMainButton(text, callback) {
+    if (tg && tg.MainButton) {
+      tg.MainButton.setText(text);
+      if (currentMainButtonHandler) tg.MainButton.offClick(currentMainButtonHandler);
+      currentMainButtonHandler = callback;
+      tg.MainButton.onClick(currentMainButtonHandler);
+      tg.MainButton.show();
+      tg.MainButton.enable();
+    }
+  }
+  function hideMainButton() {
+    if (tg && tg.MainButton) tg.MainButton.hide();
+  }
+
+  function submitBooking() {
+    var p = (appData.procedures || [])[state.proc] || {};
+    var payload = JSON.stringify({
+      action: 'book', proc_idx: state.proc,
+      proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
+      date: state.date, time: state.time,
+    });
+    if (tg && tg.sendData) {
+      try {
+        tg.sendData(payload);
+      } catch(e) {
+        alert('Ошибка отправки: ' + e.message);
+      }
+    } else {
+      alert('Ошибка: Telegram WebApp недоступен');
+    }
+  }
+
+  renderProcs();
+</script>
+</body>
+</html>"""
+
 def get_webapp_data() -> dict:
     """Формирует данные для Mini App."""
     dates_data = []
@@ -727,10 +1067,9 @@ def get_webapp_data() -> dict:
     }
 
 def build_webapp_url(uid: int) -> str:
-    import urllib.parse, time
-    data_url = BOT_HOST.rstrip("/") + "/webapp-data"
-    cache_bust = int(time.time())  # каждый раз новый, чтобы Telegram не кэшировал страницу
-    return f"{WEBAPP_URL}?v={cache_bust}&data_url={urllib.parse.quote(data_url)}"
+    import time
+    cache_bust = int(time.time())
+    return f"{BOT_HOST.rstrip('/')}/webapp-page?v={cache_bust}"
 
 def kb_main(uid):
     client = get_client(uid)
