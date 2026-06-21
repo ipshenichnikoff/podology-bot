@@ -158,6 +158,7 @@
       tgUser = tg.initDataUnsafe.user;
     }
   }
+  alert('Страница загружена. tg=' + !!tg + ' DATA_URL найден ниже');
 
   var appData = { procedures: [], dates: [] };
   var state   = { step: 1, proc: null, date: null, time: null };
@@ -360,6 +361,8 @@
       proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
       date: state.date, time: state.time,
     });
+
+    alert('Кнопка нажата! Отправляю заявку...');
 
     if (tg && tg.sendData) {
       try {
