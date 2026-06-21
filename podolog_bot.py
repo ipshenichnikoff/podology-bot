@@ -157,15 +157,7 @@ def start_http_server():
         def webapp_data():
             return JSONResponse(get_webapp_data())
 
-        @app_api.get("/webapp-page")
-        @app_api.get("/webapp-page/{cache_key}")
-        def webapp_page(cache_key: str = ""):
-            """
-            Возвращает полностью самодостаточную HTML-страницу с данными,
-            встроенными прямо в разметку (без runtime fetch к /webapp-data).
-            Путь содержит уникальный cache_key чтобы Telegram точно не смог
-            подставить закэшированную версию по тому же URL.
-            """
+        def _render_webapp_page():
             from fastapi.responses import HTMLResponse
             data = get_webapp_data()
             html = render_webapp_html(data)
@@ -177,6 +169,14 @@ def start_http_server():
                     "Expires": "0",
                 },
             )
+
+        @app_api.get("/webapp-page")
+        def webapp_page():
+            return _render_webapp_page()
+
+        @app_api.get("/webapp-page/{cache_key}")
+        def webapp_page_with_key(cache_key: str):
+            return _render_webapp_page()
 
         @app_api.post("/webapp-book")
         async def webapp_book(request: Request):
@@ -219,6 +219,8 @@ def start_http_server():
                 return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=503)
 
         port = int(os.getenv("PORT", "3000"))
+        registered_paths = [r.path for r in app_api.routes]
+        log.info("FastAPI маршруты зарегистрированы: %s", registered_paths)
         log.info("FastAPI сервер запущен на порту %d", port)
         uvicorn.run(app_api, host="0.0.0.0", port=port, log_level="warning")
     except ImportError:
