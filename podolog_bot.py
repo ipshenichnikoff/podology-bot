@@ -162,13 +162,18 @@ def start_http_server():
             """
             Возвращает полностью самодостаточную HTML-страницу с данными,
             встроенными прямо в разметку (без runtime fetch к /webapp-data).
-            Это устраняет асинхронность при загрузке, которая может мешать
-            корректной работе tg.sendData() на некоторых платформах (iOS).
             """
             from fastapi.responses import HTMLResponse
             data = get_webapp_data()
             html = render_webapp_html(data)
-            return HTMLResponse(html)
+            return HTMLResponse(
+                html,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
 
         @app_api.post("/webapp-book")
         async def webapp_book(request: Request):
