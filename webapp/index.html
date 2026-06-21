@@ -158,7 +158,6 @@
       tgUser = tg.initDataUnsafe.user;
     }
   }
-  alert('Страница загружена. tg=' + !!tg + ' DATA_URL найден ниже');
 
   var appData = { procedures: [], dates: [] };
   var state   = { step: 1, proc: null, date: null, time: null };
@@ -362,17 +361,20 @@
       date: state.date, time: state.time,
     });
 
-    alert('Кнопка нажата! Отправляю заявку...');
-
     if (tg && tg.sendData) {
       try {
         tg.sendData(payload);
-        alert('sendData выполнен успешно, длина payload: ' + payload.length);
       } catch(e) {
-        alert('ОШИБКА sendData: ' + e.message);
+        alert('Ошибка отправки: ' + e.message);
+        return;
       }
+      // На некоторых платформах (iOS) явное закрытие после sendData
+      // повышает надёжность доставки события боту
+      setTimeout(function() {
+        if (tg && tg.close) tg.close();
+      }, 100);
     } else {
-      alert('tg или tg.sendData недоступны!');
+      alert('Ошибка: Telegram WebApp недоступен');
     }
   }
 
