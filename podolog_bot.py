@@ -98,6 +98,8 @@ ST_ADM             = "adm"
 ST_ADM_ADD_NAME    = "adm_add_name"
 ST_ADM_ADD_PHONE   = "adm_add_phone"
 ST_ADM_BROADCAST   = "adm_broadcast"
+ST_ADM_REJ_REASON  = "adm_rej_reason"
+ST_ADM_CNCL_REASON = "adm_cncl_reason"
 
 MONTHS   = ["","января","февраля","марта","апреля","мая","июня",
             "июля","августа","сентября","октября","ноября","декабря"]
@@ -1109,6 +1111,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("adm_rej_"):
         if uid != ADMIN_ID: await q.answer("⛔", show_alert=True); return
         apt_id = data[len("adm_rej_"):]
+        apt = get_apt(apt_id)
+        if not apt or apt["status"] != "pending":
+            await q.edit_message_text("Запись уже обработана.")
+            return
+        ctx.user_data["adm_target_apt_id"] = apt_id
+        set_state(ctx, ST_ADM_REJ_REASON)
+        await q.edit_message_text(
+            f"❌ Отклонение записи: {apt['name']} {fmt_date(apt['date'])} в {apt['time']}\n\n"
+            "Напишите причину для клиента (или отправьте «-» чтобы отклонить без причины):")
+        return
+
+    if data.startswith("adm_skip_rej_"):
+        if uid != ADMIN_ID: await q.answer("⛔", show_alert=True); return
+        apt_id = data[len("adm_skip_rej_"):]
         apt    = reject_apt_by_admin(apt_id)
         if apt:
             try:
@@ -1199,6 +1215,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("adm_cncl_"):
         apt_id = data[len("adm_cncl_"):]
+        apt = get_apt(apt_id)
+        if not apt or apt["status"] not in ("confirmed", "pending"):
+            await q.edit_message_text("Запись не найдена.", reply_markup=kb_admin())
+            return
+        ctx.user_data["adm_target_apt_id"] = apt_id
+        set_state(ctx, ST_ADM_CNCL_REASON)
+        await q.edit_message_text(
+            f"❌ Отмена записи: {apt['name']} {fmt_date(apt['date'])} в {apt['time']}\n\n"
+            "Напишите причину для клиента (или отправьте «-» чтобы отменить без причины):")
+        return
+
+    if data.startswith("adm_skip_cncl_"):
+        apt_id = data[len("adm_skip_cncl_"):]
         apt    = cancel_apt(apt_id)
         if apt:
             cancel_reminders(ctx.application, apt_id)
@@ -1357,6 +1386,57 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Запись создана:*\n\n👤 {d['adm_name']}  📱 {text}\n💆 {d['adm_proc']}\n📅 {fmt_date(d['adm_date'])} в {d['adm_time']}",
             parse_mode="Markdown", reply_markup=kb_admin())
         set_state(ctx, ST_ADM); return
+
+    if state == ST_ADM_REJ_REASON:
+        apt_id = ctx.user_data.get("adm_target_apt_id")
+        apt    = get_apt(apt_id) if apt_id else None
+        if not apt or apt["status"] != "pending":
+            await update.message.reply_text("Запись уже обработана.", reply_markup=kb_admin())
+            set_state(ctx, ST_ADM)
+            return
+        reason = "" if text.strip() == "-" else text.strip()
+        reject_apt_by_admin(apt_id)
+        reason_line = f"\n\n💬 Причина: {reason}" if reason else ""
+        try:
+            await ctx.bot.send_message(
+                apt["user_id"],
+                f"❌ *Запись отклонена*\n\n💆 {apt['procedure']}\n📅 {fmt_date(apt['date'])} в {apt['time']}"
+                f"{reason_line}\n\nСвяжитесь: {MASTER_PHONE}",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+        set_state(ctx, ST_ADM)
+        await update.message.reply_text(
+            f"❌ Отклонено: {apt['name']} {fmt_date(apt['date'])} в {apt['time']}"
+            + (f"\nПричина отправлена клиенту: {reason}" if reason else ""),
+            reply_markup=kb_admin())
+        return
+
+    if state == ST_ADM_CNCL_REASON:
+        apt_id = ctx.user_data.get("adm_target_apt_id")
+        apt    = get_apt(apt_id) if apt_id else None
+        if not apt or apt["status"] not in ("confirmed", "pending"):
+            await update.message.reply_text("Запись уже обработана.", reply_markup=kb_admin())
+            set_state(ctx, ST_ADM)
+            return
+        reason = "" if text.strip() == "-" else text.strip()
+        cancel_apt(apt_id)
+        cancel_reminders(ctx.application, apt_id)
+        reason_line = f"\n\n💬 Причина: {reason}" if reason else ""
+        try:
+            await ctx.bot.send_message(
+                apt["user_id"],
+                f"⚠️ *Ваша запись отменена мастером*\n\n📅 {fmt_date(apt['date'])} в {apt['time']}\n💆 {apt['procedure']}"
+                f"{reason_line}\n\nСвяжитесь: {MASTER_PHONE}",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+        set_state(ctx, ST_ADM)
+        await update.message.reply_text(
+            f"✅ Запись {apt['name']} отменена."
+            + (f"\nПричина отправлена клиенту: {reason}" if reason else ""),
+            reply_markup=kb_admin())
+        return
 
     if state == ST_ADM_BROADCAST:
         uids = get_all_client_ids()
