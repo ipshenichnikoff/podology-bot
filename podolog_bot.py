@@ -158,10 +158,13 @@ def start_http_server():
             return JSONResponse(get_webapp_data())
 
         @app_api.get("/webapp-page")
-        def webapp_page():
+        @app_api.get("/webapp-page/{cache_key}")
+        def webapp_page(cache_key: str = ""):
             """
             Возвращает полностью самодостаточную HTML-страницу с данными,
             встроенными прямо в разметку (без runtime fetch к /webapp-data).
+            Путь содержит уникальный cache_key чтобы Telegram точно не смог
+            подставить закэшированную версию по тому же URL.
             """
             from fastapi.responses import HTMLResponse
             data = get_webapp_data()
@@ -1072,9 +1075,9 @@ def get_webapp_data() -> dict:
     }
 
 def build_webapp_url(uid: int) -> str:
-    import time
-    cache_bust = int(time.time())
-    return f"{BOT_HOST.rstrip('/')}/webapp-page?v={cache_bust}"
+    import time, random
+    cache_key = f"{int(time.time())}{random.randint(1000,9999)}"
+    return f"{BOT_HOST.rstrip('/')}/webapp-page/{cache_key}"
 
 def kb_main(uid):
     client = get_client(uid)
