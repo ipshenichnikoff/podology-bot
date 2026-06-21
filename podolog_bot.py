@@ -4,8 +4,6 @@ PODOLOG BOT — стабильная версия.
 Установка: pip install "python-telegram-bot[job-queue]"
 """
 
-import asyncio
-import json
 import logging
 import os
 import re
@@ -15,12 +13,11 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, parse_qs
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    Update, WebAppInfo,
+    Update,
 )
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
@@ -33,10 +30,6 @@ from telegram.ext import (
 
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН")
 ADMIN_ID      = int(os.getenv("ADMIN_ID", "223326752"))
-
-# URL Mini App на GitHub Pages (оставьте пустым если не используете)
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ipshenichnikoff.github.io/podology-bot/webapp/index.html")
-BOT_HOST   = os.getenv("BOT_HOST",   "https://bot-1781876805-1609-igorpshenichnikov.bothost.tech")
 
 MASTER_NAME   = "Екатерина Шлейфер"
 MASTER_PHONE  = "8 (920) 649 26-16"
@@ -62,7 +55,6 @@ RATE_LIMIT_COUNT  = 5
 RATE_LIMIT_WINDOW = 10
 
 # Формат: (название, длительность мин, цена_от, цена_до, описание)
-# Если цена фиксированная — цена_от == цена_до
 PROCEDURES = [
     ("Педикюр", 60, 2500, 3500,
      "Дезинфекция и очищение стоп, аппаратная обработка стоп: удаление огрубевшей кожи, мозолей, натоптышей. "
@@ -121,127 +113,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 _lock = threading.Lock()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HTTP СЕРВЕР ДЛЯ MINI APP
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Глобальная ссылка на event loop бота — нужна чтобы запускать async-код
-# из синхронных обработчиков FastAPI (они работают в отдельном потоке).
-_bot_loop = None
-_bot_app  = None
-
-def start_http_server():
-    """Запускает FastAPI сервер — bothost использует его как обёртку."""
-    try:
-        from fastapi import FastAPI, Request
-        from fastapi.responses import JSONResponse, PlainTextResponse
-        from fastapi.middleware.cors import CORSMiddleware
-        import uvicorn
-        import asyncio
-
-        app_api = FastAPI()
-        app_api.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-
-        @app_api.get("/")
-        @app_api.get("/health")
-        def health():
-            return PlainTextResponse("OK")
-
-        @app_api.get("/webapp-data")
-        def webapp_data():
-            return JSONResponse(get_webapp_data())
-
-        def _render_webapp_page():
-            from fastapi.responses import HTMLResponse
-            data = get_webapp_data()
-            html = render_webapp_html(data)
-            return HTMLResponse(
-                html,
-                headers={
-                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                },
-            )
-
-        @app_api.get("/webapp-page")
-        def webapp_page():
-            return _render_webapp_page()
-
-        @app_api.get("/webapp-page/{cache_key}")
-        def webapp_page_with_key(cache_key: str):
-            return _render_webapp_page()
-
-        @app_api.post("/webapp-book")
-        async def webapp_book(request: Request):
-            """
-            Принимает заявку напрямую от Mini App через fetch (вместо tg.sendData).
-            Это надёжнее на мобильных платформах где sendData может работать нестабильно.
-            """
-            try:
-                body = await request.json()
-            except Exception:
-                return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
-
-            uid       = body.get("uid")
-            proc_idx  = body.get("proc_idx", 0)
-            proc_name = body.get("proc_name", "")
-            date      = body.get("date", "")
-            time      = body.get("time", "")
-            pf        = body.get("proc_price_raw", 0)
-            dur       = body.get("proc_dur", 60)
-            name      = body.get("user_name", "Клиент")
-
-            if not uid or not date or not time or not proc_name:
-                return JSONResponse({"ok": False, "error": "missing fields"}, status_code=400)
-
-            uid = int(uid)
-
-            # Запускаем обработку в event loop бота
-            if _bot_loop and _bot_app:
-                future = asyncio.run_coroutine_threadsafe(
-                    _process_webapp_booking(uid, proc_idx, proc_name, date, time, pf, dur, name),
-                    _bot_loop
-                )
-                try:
-                    result = future.result(timeout=10)
-                    return JSONResponse(result)
-                except Exception as e:
-                    log.error("Ошибка обработки веб-заявки: %s", e)
-                    return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-            else:
-                return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=503)
-
-        port = int(os.getenv("PORT", "3000"))
-        registered_paths = [r.path for r in app_api.routes]
-        log.info("FastAPI маршруты зарегистрированы: %s", registered_paths)
-        log.info("FastAPI сервер запущен на порту %d", port)
-        uvicorn.run(app_api, host="0.0.0.0", port=port, log_level="warning")
-    except ImportError:
-        # Fallback на встроенный HTTP сервер если нет FastAPI
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        class H(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path in ("/webapp-data",):
-                    body = json.dumps(get_webapp_data(), ensure_ascii=False).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"OK")
-            def log_message(self, *a): pass
-        port = int(os.getenv("PORT", "3000"))
-        HTTPServer(("0.0.0.0", port), H).serve_forever()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # АНТИСПАМ
@@ -732,363 +603,12 @@ async def _process_reminders(ctx: ContextTypes.DEFAULT_TYPE):
 # КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_webapp_html(data: dict) -> str:
-    """
-    Генерирует полностью самодостаточную HTML-страницу Mini App
-    с данными, встроенными прямо в JS (без отдельного fetch-запроса).
-    """
-    import json as _json
-    data_json = _json.dumps(data, ensure_ascii=False)
-
-    return """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Запись к подологу</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  :root {
-    --bg: #f5f5f5; --card: #ffffff;
-    --primary: #e91e8c; --primary-light: #fce4f3;
-    --text: #1a1a1a; --text-muted: #888;
-    --border: #eee; --radius: 16px;
-  }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: var(--bg); color: var(--text);
-    min-height: 100vh; padding-bottom: 30px;
-  }
-  .header {
-    background: linear-gradient(135deg, #e91e8c, #c2185b);
-    color: white; padding: 20px 16px 24px; text-align: center;
-  }
-  .header h1 { font-size: 20px; font-weight: 700; }
-  .header p  { font-size: 13px; opacity: 0.85; margin-top: 4px; }
-  .steps {
-    display: flex; justify-content: center; gap: 8px;
-    padding: 16px; background: white; border-bottom: 1px solid var(--border);
-  }
-  .step {
-    width: 32px; height: 32px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 13px; font-weight: 600;
-    background: var(--border); color: var(--text-muted); transition: all .3s;
-  }
-  .step.active { background: var(--primary); color: white; }
-  .step.done   { background: #4caf50; color: white; }
-  .step-line   { flex: 1; height: 2px; background: var(--border); align-self: center; max-width: 40px; }
-  .screen { display: none; padding: 16px; }
-  .screen.active { display: block; }
-  .section-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; }
-  .proc-card {
-    background: var(--card); border-radius: var(--radius);
-    padding: 14px 16px; margin-bottom: 10px;
-    border: 2px solid transparent; cursor: pointer; display: flex; align-items: center; gap: 12px;
-  }
-  .proc-card.selected { border-color: var(--primary); background: var(--primary-light); }
-  .proc-icon {
-    width: 44px; height: 44px; border-radius: 12px; background: var(--primary-light);
-    display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0;
-  }
-  .proc-info { flex: 1; }
-  .proc-name { font-size: 15px; font-weight: 600; }
-  .proc-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-  .proc-price { font-size: 14px; font-weight: 700; color: var(--primary); white-space: nowrap; }
-  .dates-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
-  .date-btn {
-    background: var(--card); border: 2px solid transparent;
-    border-radius: 12px; padding: 10px 4px; text-align: center; cursor: pointer;
-  }
-  .date-btn.selected { border-color: var(--primary); background: var(--primary-light); }
-  .date-btn .day-name { font-size: 11px; color: var(--text-muted); }
-  .date-btn .day-num  { font-size: 18px; font-weight: 700; margin: 2px 0; }
-  .date-btn .day-mon  { font-size: 11px; color: var(--text-muted); }
-  .date-btn .dot { width: 6px; height: 6px; border-radius: 50%; margin: 4px auto 0; }
-  .dot.green { background: #4caf50; } .dot.yellow { background: #ff9800; } .dot.red { background: #f44336; }
-  .times-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .time-btn {
-    background: var(--card); border: 2px solid transparent;
-    border-radius: 12px; padding: 12px 8px; text-align: center;
-    font-size: 16px; font-weight: 600; cursor: pointer;
-  }
-  .time-btn.selected { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
-  .summary-card { background: var(--card); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
-  .summary-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
-  .summary-row:last-child { border-bottom: none; }
-  .summary-icon { font-size: 20px; width: 28px; text-align: center; flex-shrink: 0; }
-  .summary-label { font-size: 12px; color: var(--text-muted); }
-  .summary-value { font-size: 15px; font-weight: 600; margin-top: 2px; }
-  .master-card { background: var(--card); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-  .master-avatar { width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, #e91e8c, #c2185b); display: flex; align-items: center; justify-content: center; font-size: 24px; flex-shrink: 0; }
-  .master-name { font-size: 15px; font-weight: 700; }
-  .master-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-  .success-screen { text-align: center; padding: 40px 20px; }
-  .success-icon { font-size: 64px; margin-bottom: 16px; }
-  .success-screen h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
-  .success-screen p  { color: var(--text-muted); font-size: 14px; line-height: 1.5; }
-  .empty { text-align: center; color: var(--text-muted); padding: 32px 0; font-size: 14px; }
-</style>
-</head>
-<body>
-
-<div class="header">
-  <h1>💆 Запись к подологу</h1>
-  <p id="masterInfo">""" + data.get("master_name", "") + """ · ⭐ """ + str(data.get("rating", "4.9")) + """</p>
-</div>
-
-<div class="steps">
-  <div class="step active" id="step1">1</div>
-  <div class="step-line"></div>
-  <div class="step" id="step2">2</div>
-  <div class="step-line"></div>
-  <div class="step" id="step3">3</div>
-  <div class="step-line"></div>
-  <div class="step" id="step4">✓</div>
-</div>
-
-<div class="screen active" id="screen1">
-  <div class="section-title">Выберите процедуру</div>
-  <div id="procList"></div>
-</div>
-
-<div class="screen" id="screen2">
-  <div class="section-title">Выберите дату</div>
-  <div class="dates-grid" id="dateGrid"></div>
-  <div class="section-title" id="timesTitle" style="display:none">Выберите время</div>
-  <div class="times-grid" id="timesGrid"></div>
-</div>
-
-<div class="screen" id="screen3">
-  <div class="section-title">Подтверждение записи</div>
-  <div class="summary-card" id="summaryCard"></div>
-  <div class="master-card">
-    <div class="master-avatar">👩‍⚕️</div>
-    <div>
-      <div class="master-name">""" + data.get("master_name", "") + """</div>
-      <div class="master-meta">""" + data.get("master_phone", "") + """</div>
-    </div>
-  </div>
-</div>
-
-<div class="screen" id="screen4">
-  <div class="success-screen">
-    <div class="success-icon">🎉</div>
-    <h2>Заявка отправлена!</h2>
-    <p>Мастер подтвердит запись в ближайшее время.<br>Вы получите уведомление в этом чате.</p>
-  </div>
-</div>
-
-<script>
-  // Данные встроены статически — никакого fetch при загрузке не требуется.
-  // Это устраняет асинхронность, которая могла мешать tg.sendData() на iOS.
-  var appData = """ + data_json + """;
-
-  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-  var tgUser = { first_name: 'Клиент', id: 0 };
-  if (tg) {
-    tg.ready();
-    tg.expand();
-    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-      tgUser = tg.initDataUnsafe.user;
-    }
-  }
-
-  var state = { step: 1, proc: null, date: null, time: null };
-  var ICONS    = ['🦶','🩺','💉','💅','🔧','⚙️','🛡️','🩹','🔬'];
-  var MONTHS_S = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-  var DAYS_S   = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
-
-  function renderProcs() {
-    var list = document.getElementById('procList');
-    var procs = appData.procedures || [];
-    if (!procs.length) {
-      list.innerHTML = '<div class="empty">Нет доступных услуг</div>';
-      return;
-    }
-    var html = '';
-    for (var i = 0; i < procs.length; i++) {
-      var p = procs[i];
-      html += '<div class="proc-card" data-idx="' + i + '">' +
-        '<div class="proc-icon">' + ICONS[i % ICONS.length] + '</div>' +
-        '<div class="proc-info"><div class="proc-name">' + p.name + '</div>' +
-        '<div class="proc-meta">⏱ ' + p.dur + ' мин</div></div>' +
-        '<div class="proc-price">' + p.price + '</div></div>';
-    }
-    list.innerHTML = html;
-    var cards = list.querySelectorAll('.proc-card');
-    for (var j = 0; j < cards.length; j++) {
-      cards[j].addEventListener('click', function() {
-        selectProc(parseInt(this.getAttribute('data-idx'), 10));
-      });
-    }
-  }
-
-  function selectProc(i) {
-    state.proc = i;
-    var cards = document.querySelectorAll('.proc-card');
-    for (var j = 0; j < cards.length; j++) cards[j].classList.toggle('selected', i === j);
-    setTimeout(function() { goToStep(2); }, 250);
-  }
-
-  function renderDates() {
-    var dates = appData.dates || [];
-    var grid  = document.getElementById('dateGrid');
-    if (!dates.length) {
-      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Свободных дат нет</div>';
-      return;
-    }
-    var html = '';
-    for (var i = 0; i < dates.length; i++) {
-      var d   = dates[i];
-      var dt  = new Date(d.date + 'T00:00:00');
-      var dot = d.free >= d.total ? 'green' : (d.free > Math.floor(d.total/2) ? 'yellow' : 'red');
-      html += '<div class="date-btn" data-date="' + d.date + '">' +
-        '<div class="day-name">' + DAYS_S[dt.getDay()] + '</div>' +
-        '<div class="day-num">' + dt.getDate() + '</div>' +
-        '<div class="day-mon">' + MONTHS_S[dt.getMonth()] + '</div>' +
-        '<div class="dot ' + dot + '"></div></div>';
-    }
-    grid.innerHTML = html;
-    var btns = grid.querySelectorAll('.date-btn');
-    for (var j = 0; j < btns.length; j++) {
-      btns[j].addEventListener('click', function() {
-        selectDate(this.getAttribute('data-date'));
-      });
-    }
-  }
-
-  function selectDate(date) {
-    state.date = date; state.time = null;
-    var btns = document.querySelectorAll('.date-btn');
-    for (var i = 0; i < btns.length; i++)
-      btns[i].classList.toggle('selected', btns[i].getAttribute('data-date') === date);
-    var d = null, dates = appData.dates || [];
-    for (var j = 0; j < dates.length; j++) if (dates[j].date === date) { d = dates[j]; break; }
-    var slots = d ? d.slots : [];
-    document.getElementById('timesTitle').style.display = slots.length ? 'block' : 'none';
-    var timesGrid = document.getElementById('timesGrid');
-    var html = '';
-    for (var k = 0; k < slots.length; k++) {
-      html += '<div class="time-btn" data-time="' + slots[k] + '">' + slots[k] + '</div>';
-    }
-    timesGrid.innerHTML = html;
-    var tbtns = timesGrid.querySelectorAll('.time-btn');
-    for (var m = 0; m < tbtns.length; m++) {
-      tbtns[m].addEventListener('click', function() {
-        selectTime(this.getAttribute('data-time'));
-      });
-    }
-  }
-
-  function selectTime(t) {
-    state.time = t;
-    var btns = document.querySelectorAll('.time-btn');
-    for (var i = 0; i < btns.length; i++)
-      btns[i].classList.toggle('selected', btns[i].getAttribute('data-time') === t);
-    setTimeout(function() { goToStep(3); }, 250);
-  }
-
-  function renderSummary() {
-    var p  = (appData.procedures || [])[state.proc] || {};
-    var dt = new Date(state.date + 'T00:00:00');
-    var dateStr = DAYS_S[dt.getDay()] + ', ' + dt.getDate() + ' ' + MONTHS_S[dt.getMonth()];
-    document.getElementById('summaryCard').innerHTML =
-      row('💆','Процедура', p.name || '—') +
-      row('📅','Дата и время', dateStr + ' в ' + state.time) +
-      row('⏱','Длительность', p.dur + ' мин') +
-      row('💰','Стоимость', p.price) +
-      row('👤','Клиент', tgUser.first_name || 'Клиент');
-  }
-
-  function row(icon, label, value) {
-    return '<div class="summary-row"><div class="summary-icon">' + icon + '</div>' +
-      '<div><div class="summary-label">' + label + '</div>' +
-      '<div class="summary-value">' + value + '</div></div></div>';
-  }
-
-  function goToStep(n) {
-    var screens = document.querySelectorAll('.screen');
-    for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('active', i+1 === n);
-    for (var j = 1; j <= 4; j++) {
-      var el = document.getElementById('step' + j);
-      el.className = 'step' + (j < n ? ' done' : j === n ? ' active' : '');
-      el.textContent = j < n ? '✓' : j;
-    }
-    state.step = n;
-    if (n === 2) { renderDates(); hideMainButton(); }
-    if (n === 3) { renderSummary(); showMainButton('Отправить заявку ✓', submitBooking); }
-  }
-
-  var currentMainButtonHandler = null;
-  function showMainButton(text, callback) {
-    if (tg && tg.MainButton) {
-      tg.MainButton.setText(text);
-      if (currentMainButtonHandler) tg.MainButton.offClick(currentMainButtonHandler);
-      currentMainButtonHandler = callback;
-      tg.MainButton.onClick(currentMainButtonHandler);
-      tg.MainButton.show();
-      tg.MainButton.enable();
-    }
-  }
-  function hideMainButton() {
-    if (tg && tg.MainButton) tg.MainButton.hide();
-  }
-
-  function submitBooking() {
-    var p = (appData.procedures || [])[state.proc] || {};
-    var payload = JSON.stringify({
-      action: 'book', proc_idx: state.proc,
-      proc_name: p.name, proc_dur: p.dur, proc_price_raw: p.price_raw,
-      date: state.date, time: state.time,
-    });
-    if (tg && tg.sendData) {
-      try {
-        tg.sendData(payload);
-      } catch(e) {
-        alert('Ошибка отправки: ' + e.message);
-      }
-    } else {
-      alert('Ошибка: Telegram WebApp недоступен');
-    }
-  }
-
-  renderProcs();
-</script>
-</body>
-</html>"""
-
-def get_webapp_data() -> dict:
-    """Формирует данные для Mini App."""
-    dates_data = []
-    total_slots = (WORK_END - WORK_START) * 60 // SLOT_MIN
-    for d in available_dates():
-        slots = free_slots(d)
-        if slots:
-            dates_data.append({"date": d, "slots": slots, "free": len(slots), "total": total_slots})
-    return {
-        "master_name":  MASTER_NAME,
-        "master_phone": MASTER_PHONE,
-        "rating":       MASTER_RATING,
-        "procedures":   [{"name": name, "dur": dur, "price": fmt_price(pf, pt), "price_raw": pf}
-                         for name, dur, pf, pt, _ in PROCEDURES],
-        "dates": dates_data,
-    }
-
-def build_webapp_url(uid: int) -> str:
-    import time, random
-    cache_key = f"{int(time.time())}{random.randint(1000,9999)}"
-    return f"{BOT_HOST.rstrip('/')}/webapp-page/{cache_key}"
-
 def kb_main(uid):
     client = get_client(uid)
     rows   = []
     if client and client.get("last_proc"):
         short = client["last_proc"][:28] + "…" if len(client["last_proc"]) > 28 else client["last_proc"]
         rows.append([InlineKeyboardButton(f"🔄 Повторить: {short}", callback_data="repeat")])
-    if WEBAPP_URL:
-        rows.append([InlineKeyboardButton("📱 Записаться (приложение)", web_app=WebAppInfo(url=build_webapp_url(uid)))])
     rows += [
         [InlineKeyboardButton("📅 Записаться",    callback_data="book"),
          InlineKeyboardButton("📋 Мои записи",    callback_data="my_apts")],
@@ -1790,145 +1310,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ОБРАБОТЧИК КОНТАКТА И ТЕКСТА
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _process_webapp_booking(uid, proc_idx, proc_name, date, time, pf, dur, name):
-    """
-    Общая логика обработки заявки из Mini App.
-    Используется и из tg.sendData (on_web_app_data), и из прямого HTTP POST (/webapp-book).
-    Возвращает dict с результатом для ответа клиенту.
-    """
-    bot = _bot_app.bot
-    client = get_client(uid)
-    phone  = client["phone"] if client and client.get("phone") else None
-
-    if not phone:
-        # Просим телефон через обычный чат с ботом
-        try:
-            await bot.send_message(
-                uid, "📱 Для завершения записи нужен ваш номер телефона.\n\n"
-                     "Нажмите кнопку ниже 👇")
-            await bot.send_message(uid, "Поделитесь номером:",
-                                    reply_markup=kb_phone())
-        except Exception as e:
-            log.warning("Не удалось запросить телефон: %s", e)
-        # Сохраняем контекст записи во временную БД-таблицу clients, чтобы
-        # подхватить её когда придёт номер телефона через on_contact/on_message.
-        # Простое решение: используем глобальный словарь в памяти.
-        _pending_bookings[uid] = dict(
-            proc=proc_name, dur=dur, price=pf, date=date, time=time, name=name
-        )
-        return {"ok": True, "status": "phone_requested"}
-
-    try:
-        apt_id = add_apt(date, time, name, phone, uid, proc_name, dur, pf)
-    except ValueError as e:
-        try:
-            await bot.send_message(uid, str(e), reply_markup=kb_main(uid))
-        except Exception:
-            pass
-        return {"ok": False, "error": str(e)}
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🔔 *Новая заявка (Mini App)!*\n\n👤 {name}  📱 {phone}\n💆 {proc_name}\n"
-            f"📅 {fmt_date(date)} в {time}\n💰 {pf:,} ₽\n\nПодтвердите:".replace(",", " "),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
-                InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
-            ]]), parse_mode="Markdown")
-    except Exception as e:
-        log.warning("Не удалось уведомить админа: %s", e)
-
-    try:
-        await bot.send_message(
-            uid,
-            f"🎉 *Заявка отправлена!*\n\n💆 {proc_name}\n📅 {fmt_date(date)} в {time}\n\n"
-            "⏳ Мастер подтвердит запись в ближайшее время.",
-            parse_mode="Markdown", reply_markup=kb_main(uid))
-    except Exception as e:
-        log.warning("Не удалось уведомить клиента: %s", e)
-
-    return {"ok": True, "status": "booked", "apt_id": apt_id}
-
-# Временное хранилище незавершённых записей (ждут номер телефона)
-_pending_bookings = {}
-
-async def on_web_app_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    import json
-    log.info("WEB_APP_DATA получено от uid=%s: %s", update.effective_user.id,
-              update.message.web_app_data.data if update.message.web_app_data else "NONE")
-    try:
-        data = json.loads(update.message.web_app_data.data)
-    except Exception as e:
-        log.warning("Ошибка парсинга web_app_data: %s", e)
-        return
-    if data.get("action") != "book":
-        log.info("action != book, пропускаем: %s", data.get("action"))
-        return
-    uid       = update.effective_user.id
-    proc_idx  = data.get("proc_idx", 0)
-    proc_name = data.get("proc_name", "")
-    date      = data.get("date", "")
-    time      = data.get("time", "")
-    pf        = data.get("proc_price_raw", 0)
-    dur       = data.get("proc_dur", 60)
-    name      = update.effective_user.full_name or update.effective_user.first_name or "Клиент"
-    client    = get_client(uid)
-    phone     = client["phone"] if client and client.get("phone") else None
-    if not phone:
-        ctx.user_data.update(proc=proc_name, dur=dur, price=pf, date=date, time=time, name=name)
-        set_state(ctx, ST_PHONE)
-        await update.message.reply_text("📱 Нужен ваш номер телефона:", reply_markup=kb_phone())
-        return
-    try:
-        apt_id = add_apt(date, time, name, phone, uid, proc_name, dur, pf)
-    except ValueError as e:
-        await update.message.reply_text(str(e), reply_markup=kb_main(uid)); return
-    ctx.user_data.clear(); set_state(ctx, ST_MAIN)
-    try:
-        await ctx.bot.send_message(ADMIN_ID,
-            f"🔔 *Новая заявка (Mini App)!*\n\n👤 {name}  📱 {phone}\n💆 {proc_name}\n📅 {fmt_date(date)} в {time}\n💰 {pf:,} ₽\n\nПодтвердите:".replace(",", " "),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
-                InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
-            ]]), parse_mode="Markdown")
-    except Exception: pass
-    await update.message.reply_text(
-        f"🎉 *Заявка отправлена!*\n\n💆 {proc_name}\n📅 {fmt_date(date)} в {time}\n\n⏳ Мастер подтвердит запись в ближайшее время.",
-        parse_mode="Markdown", reply_markup=kb_main(uid))
-
 async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     phone = update.message.contact.phone_number
     if not phone.startswith("+"): phone = "+" + phone
-    uid = update.effective_user.id
-
-    # Если есть незавершённая запись из Mini App — обрабатываем здесь
-    if uid in _pending_bookings:
-        pending = _pending_bookings.pop(uid)
-        await update.message.reply_text(f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
-        try:
-            apt_id = add_apt(pending["date"], pending["time"], pending["name"], phone,
-                              uid, pending["proc"], pending["dur"], pending["price"])
-        except ValueError as e:
-            await update.message.reply_text(str(e), reply_markup=kb_main(uid)); return
-        try:
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"🔔 *Новая заявка (Mini App)!*\n\n👤 {pending['name']}  📱 {phone}\n"
-                f"💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n"
-                f"💰 {pending['price']:,} ₽\n\nПодтвердите:".replace(",", " "),
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
-                    InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
-                ]]), parse_mode="Markdown")
-        except Exception: pass
-        set_state(ctx, ST_MAIN)
-        await update.message.reply_text(
-            f"🎉 *Заявка отправлена!*\n\n💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n\n"
-            "⏳ Мастер подтвердит запись в ближайшее время.",
-            parse_mode="Markdown", reply_markup=kb_main(uid))
-        return
-
     ctx.user_data["phone"] = phone
     await update.message.reply_text(f"✅ Номер получен: {phone}", reply_markup=ReplyKeyboardRemove())
     set_state(ctx, ST_CONFIRM)
@@ -1941,38 +1325,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_rate_limited(uid):
         await update.message.reply_text("⏳ Не так быстро!"); return
-
-    # Если есть незавершённая запись из Mini App (HTTP-флоу) — обрабатываем номер здесь
-    if uid in _pending_bookings:
-        if not validate_phone(text):
-            await update.message.reply_text("❌ Неверный формат. Нажмите кнопку ниже 👇", reply_markup=kb_phone()); return
-        phone = re.sub(r"\D", "", text)
-        if phone.startswith("8"): phone = "7" + phone[1:]
-        phone = "+" + phone
-        pending = _pending_bookings.pop(uid)
-        await update.message.reply_text("✅ Номер принят.", reply_markup=ReplyKeyboardRemove())
-        try:
-            apt_id = add_apt(pending["date"], pending["time"], pending["name"], phone,
-                              uid, pending["proc"], pending["dur"], pending["price"])
-        except ValueError as e:
-            await update.message.reply_text(str(e), reply_markup=kb_main(uid)); return
-        try:
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"🔔 *Новая заявка (Mini App)!*\n\n👤 {pending['name']}  📱 {phone}\n"
-                f"💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n"
-                f"💰 {pending['price']:,} ₽\n\nПодтвердите:".replace(",", " "),
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_ok_{apt_id}"),
-                    InlineKeyboardButton("❌ Отклонить",   callback_data=f"adm_rej_{apt_id}"),
-                ]]), parse_mode="Markdown")
-        except Exception: pass
-        set_state(ctx, ST_MAIN)
-        await update.message.reply_text(
-            f"🎉 *Заявка отправлена!*\n\n💆 {pending['proc']}\n📅 {fmt_date(pending['date'])} в {pending['time']}\n\n"
-            "⏳ Мастер подтвердит запись в ближайшее время.",
-            parse_mode="Markdown", reply_markup=kb_main(uid))
-        return
 
     if state == ST_PHONE:
         if not validate_phone(text):
@@ -2025,21 +1377,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _post_init(app):
-    """Вызывается после старта event loop — сохраняем ссылки для HTTP сервера."""
-    global _bot_app, _bot_loop
-    _bot_app  = app
-    _bot_loop = asyncio.get_running_loop()
-    log.info("Bot app и event loop зарегистрированы для HTTP сервера")
-
 def main():
     init_db()
     persistence = PicklePersistence(filepath="podolog_data")
-    app = (Application.builder()
-           .token(BOT_TOKEN)
-           .persistence(persistence)
-           .post_init(_post_init)
-           .build())
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("book",    cmd_book))
@@ -2049,22 +1390,7 @@ def main():
     app.add_handler(CommandHandler("about",   cmd_about))
     app.add_handler(CommandHandler("export",  cmd_export))
     app.add_handler(CommandHandler("admin",   cmd_admin))
-
-    # Диагностика: логируем абсолютно все входящие сообщения (группа -1 = раньше остальных,
-    # не блокирует дальнейшую обработку благодаря отдельной группе)
-    async def _log_all_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.message:
-            wad = getattr(update.message, "web_app_data", None)
-            log.info(
-                "RAW UPDATE: uid=%s text=%r web_app_data=%r",
-                update.effective_user.id if update.effective_user else "?",
-                update.message.text,
-                wad.data if wad else None,
-            )
-    app.add_handler(MessageHandler(filters.ALL, _log_all_messages), group=-1)
-
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
@@ -2074,10 +1400,6 @@ def main():
         log.info("Планировщик напоминаний из БД запущен ✅")
     else:
         log.warning('JobQueue недоступен. pip install "python-telegram-bot[job-queue]"')
-
-    # Запускаем HTTP сервер для Mini App в фоне
-    http_thread = threading.Thread(target=start_http_server, daemon=True)
-    http_thread.start()
 
     log.info("Бот запущен ✅")
     app.run_polling(drop_pending_updates=True)
