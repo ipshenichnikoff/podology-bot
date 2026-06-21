@@ -364,15 +364,11 @@
     if (tg && tg.sendData) {
       try {
         tg.sendData(payload);
+        // sendData сама закрывает Mini App — не вызываем close() дополнительно,
+        // двойное закрытие может прервать доставку события на iOS
       } catch(e) {
         alert('Ошибка отправки: ' + e.message);
-        return;
       }
-      // На некоторых платформах (iOS) явное закрытие после sendData
-      // повышает надёжность доставки события боту
-      setTimeout(function() {
-        if (tg && tg.close) tg.close();
-      }, 100);
     } else {
       alert('Ошибка: Telegram WebApp недоступен');
     }
