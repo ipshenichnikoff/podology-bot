@@ -367,6 +367,7 @@
     if (tg && tg.sendData) {
       try {
         tg.sendData(payload);
+        alert('sendData выполнен успешно, длина payload: ' + payload.length);
       } catch(e) {
         alert('ОШИБКА sendData: ' + e.message);
       }
